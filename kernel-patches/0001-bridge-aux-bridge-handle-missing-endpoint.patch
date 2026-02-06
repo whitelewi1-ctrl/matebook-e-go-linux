@@ -1,0 +1,43 @@
+From: Lewis White <whitelewis@matebook-e-go>
+Date: Thu, 6 Feb 2026 00:24:39 +0700
+Subject: [PATCH 1/4] bridge: aux-bridge: handle missing endpoint gracefully
+
+On the Snapdragon 8cx Gen 3 (sc8280xp), some USB-C PHYs support
+DisplayPort alternate mode but have no corresponding display output
+connected. In this case, the endpoint node is absent from the device
+tree, causing devm_drm_of_get_bridge() to return -ENODEV.
+
+Instead of failing the entire auxiliary device probe (which prevents the
+USB-C PHY driver from loading), return 0 to succeed silently without
+adding the bridge.
+
+Signed-off-by: Lewis White <whitelewis@matebook-e-go>
+---
+ drivers/gpu/drm/bridge/aux-bridge.c | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/bridge/aux-bridge.c b/drivers/gpu/drm/bridge/aux-bridge.c
+index abcdef1..1234567 100644
+--- a/drivers/gpu/drm/bridge/aux-bridge.c
++++ b/drivers/gpu/drm/bridge/aux-bridge.c
+@@ -119,9 +119,19 @@
+
+ 	data->dev = &auxdev->dev;
+ 	data->next_bridge = devm_drm_of_get_bridge(&auxdev->dev, auxdev->dev.of_node, 0, 0);
+-	if (IS_ERR(data->next_bridge))
++	if (IS_ERR(data->next_bridge)) {
++		/*
++		 * If there's no endpoint defined in DT (ENODEV), succeed
++		 * silently without adding the bridge. This happens on devices
++		 * where the PHY supports DP but is not used for display output.
++		 */
++		if (PTR_ERR(data->next_bridge) == -ENODEV) {
++			dev_dbg(&auxdev->dev, "no endpoint defined, skipping bridge\n");
++			return 0;
++		}
+ 		return dev_err_probe(&auxdev->dev, PTR_ERR(data->next_bridge),
+ 				     "failed to acquire drm_bridge\n");
++	}
+
+ 	data->bridge.of_node = data->dev->of_node;
+ 	data->bridge.funcs = &drm_aux_bridge_funcs;

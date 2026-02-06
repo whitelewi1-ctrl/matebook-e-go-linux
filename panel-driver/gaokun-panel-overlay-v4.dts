@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Device Tree Overlay for Huawei MateBook E Go Panel
+ * Version 4: Without label references (for DTBs without __symbols__)
+ */
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/soc@0/display-subsystem@ae00000/dsi@ae94000";
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			qcom,dual-dsi-mode;
+			qcom,master-dsi;
+
+			panel@0 {
+				compatible = "himax,hx83121a";
+				reg = <0>;
+				status = "okay";
+			};
+		};
+	};
+
+	fragment@1 {
+		target-path = "/soc@0/display-subsystem@ae00000/dsi@ae96000";
+		__overlay__ {
+			qcom,dual-dsi-mode;
+		};
+	};
+
+	/* Disable DisplayPort controllers - not needed for DSI panel */
+	fragment@2 {
+		target-path = "/soc@0/display-subsystem@ae00000/displayport-controller@ae90000";
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	fragment@3 {
+		target-path = "/soc@0/display-subsystem@ae00000/displayport-controller@ae98000";
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+};
