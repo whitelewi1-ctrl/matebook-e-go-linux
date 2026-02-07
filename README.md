@@ -18,6 +18,7 @@ Native GPU-accelerated display driver for the Huawei MateBook E Go, the first wo
 - **Kernel patches** (`kernel-patches/`) -- 4 patches against Linux 6.18.8 fixing clock, DPU, and bridge bugs
 - **Device tree** (`device-tree/`) -- DTS source and pre-built DTB for the MateBook E Go
 - **Boot configs** (`boot/`) -- reference GRUB and mkinitcpio configurations
+- **Touchpad activation** (`tools/touchpad/`) -- systemd service + script for keyboard cover touchpad
 - **Diagnostic tool** (`tools/`) -- userspace tool to read DPU/DSC/INTF/DSI hardware registers
 
 ## Bug fixes
@@ -90,7 +91,9 @@ See [docs/BUILDING.md](docs/BUILDING.md), [docs/BOOT_SETUP.md](docs/BOOT_SETUP.m
 
 ## Keyboard cover touchpad
 
-The MateBook E Go keyboard cover (USB 12d1:10b8) requires `HID_QUIRK_NO_INIT_REPORTS` to function properly. Without this quirk, the HID subsystem sends `GET_REPORT` requests during initialization that return empty responses, blocking the control transfer queue and preventing `hid-multitouch` from setting the touchpad's Input Mode.
+The MateBook E Go keyboard cover (USB 12d1:10b8) requires two fixes for full touchpad support:
+
+### 1. USB HID quirk
 
 Add to your kernel command line:
 
@@ -98,7 +101,21 @@ Add to your kernel command line:
 usbhid.quirks=0x12d1:0x10b8:0x20000000
 ```
 
-This sets `HID_QUIRK_NO_INIT_REPORTS` (BIT(29) = 0x20000000) for the Huawei keyboard cover. The keyboard works without this quirk; only the touchpad is affected.
+This sets `HID_QUIRK_NO_INIT_REPORTS` (BIT(29) = 0x20000000). Without it, the HID subsystem sends `GET_REPORT` requests that return empty responses, blocking the control queue and preventing `hid-multitouch` from setting Input Mode=3 (Touchpad).
+
+### 2. Activation service
+
+The touchpad firmware requires a USB port reset after enumeration, followed by a driver rebind so `hid-multitouch` can successfully configure the device. The script also injects `SW_TABLET_MODE=0` to work around the `gpio-keys` tablet-mode switch reporting an inverted state (the DTS fix changes the GPIO polarity to `GPIO_ACTIVE_LOW`, but the software injection provides a fallback).
+
+```bash
+cp tools/touchpad/huawei-tp-activate.py /usr/local/bin/
+cp tools/touchpad/huawei-touchpad.service /etc/systemd/system/
+chmod +x /usr/local/bin/huawei-tp-activate.py
+systemctl daemon-reload
+systemctl enable huawei-touchpad.service
+```
+
+The service runs before the display manager at `sysinit.target`, ensuring the touchpad is ready when GNOME/Wayland starts.
 
 ## WiFi (WCN6855 / ath11k)
 
@@ -121,7 +138,7 @@ ath11k_pci
 - Display: working (1600x2560 @ 60 Hz, hardware-accelerated via MSM DRM)
 - Backlight: working (DSI-controlled)
 - fbcon: working (with `fbcon=rotate:1` for portrait panel)
-- Keyboard cover: working (keyboard + touchpad with usbhid quirk)
+- Keyboard cover: working (keyboard + touchpad with usbhid quirk + activation service)
 - WiFi: working (WCN6855 / ath11k_pci)
 - Touchscreen: not working (I2C bus timeout on i2c@990000)
 - GPU acceleration (Adreno): untested beyond basic modesetting

@@ -90,7 +90,7 @@
 
 		switch-mode {
 			label = "Tablet Mode Switch";
-			gpios = <&tlmm 26 GPIO_ACTIVE_HIGH>;
+			gpios = <&tlmm 26 GPIO_ACTIVE_LOW>;
 			linux,input-type = <EV_SW>;
 			linux,code = <SW_TABLET_MODE>;
 			debounce-interval = <10>;
