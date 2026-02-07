@@ -18,12 +18,12 @@ btrfs is recommended over ext4 due to better resilience against frequent hard re
 Place this in your GRUB config (e.g., `/boot/grub/grub.cfg` or `/etc/grub.d/40_custom`):
 
 ```
-menuentry "Linux 6.18 (MSM DRM)" {
+menuentry "Arch Linux" {
     linux /boot/vmlinuz-linux-6.18 root=UUID=<your-root-uuid> rootfstype=btrfs rw \
         clk_ignore_unused pd_ignore_unused arm64.nopauth \
         iommu.passthrough=0 iommu.strict=0 \
         pcie_aspm.policy=powersupersave efi=noruntime \
-        fbcon=rotate:1 loglevel=7
+        fbcon=rotate:1 usbhid.quirks=0x12d1:0x10b8:0x20000000 loglevel=7
     initrd /boot/initramfs-linux-6.18.img
     devicetree /boot/sc8280xp-huawei-gaokun3.dtb
 }
@@ -37,6 +37,7 @@ menuentry "Linux 6.18 (MSM DRM)" {
 | `pd_ignore_unused` | Same for power domains |
 | `arm64.nopauth` | Disable pointer authentication (firmware may not support it) |
 | `fbcon=rotate:1` | Rotate the fbcon framebuffer 90 degrees for the portrait-orientation panel |
+| `usbhid.quirks=0x12d1:0x10b8:0x20000000` | Enable keyboard cover touchpad (HID_QUIRK_NO_INIT_REPORTS) |
 | `devicetree /boot/sc8280xp-huawei-gaokun3.dtb` | **Critical**: load the custom DTB with panel node |
 
 ### Optional parameters
@@ -83,10 +84,18 @@ mkinitcpio -p linux-6.18
 5. Update GRUB config with `devicetree` line
 6. Reboot
 
-## Dual-boot with stable kernel
+## WiFi setup
 
-The reference `boot/grub.cfg` includes two entries:
-- **6.18 (MSM DRM)**: Full GPU-accelerated display via MSM DRM
-- **6.14 (simpledrm)**: Fallback with simpledrm (no GPU acceleration, but stable)
+The WCN6855 WiFi chip works via ath11k_pci. Create `/etc/modules-load.d/wifi.conf`:
 
-Keep the stable kernel entry as a fallback during development.
+```
+pci-pwrctrl-pwrseq
+ath11k_pci
+```
+
+If your kernel has `CONFIG_PCI_PWRCTRL=y` (built-in), remove the duplicate module:
+
+```bash
+rm /usr/lib/modules/$(uname -r)/kernel/drivers/pci/pwrctrl/pci-pwrctrl-core.ko
+depmod -a
+```

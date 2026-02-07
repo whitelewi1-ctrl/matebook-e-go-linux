@@ -78,20 +78,52 @@ cp device-tree/sc8280xp-huawei-gaokun3.dtb /boot/
 Key GRUB parameters (see `boot/grub.cfg` for full reference):
 
 ```
-clk_ignore_unused pd_ignore_unused arm64.nopauth fbcon=rotate:1
+clk_ignore_unused pd_ignore_unused arm64.nopauth fbcon=rotate:1 usbhid.quirks=0x12d1:0x10b8:0x20000000
 devicetree /boot/sc8280xp-huawei-gaokun3.dtb
 ```
 
 The `devicetree` line is **required** -- the sc8280xp UEFI firmware does not provide a suitable DTB.
 
+The `usbhid.quirks` parameter enables the keyboard cover touchpad (see Keyboard Cover section below).
+
 See [docs/BUILDING.md](docs/BUILDING.md), [docs/BOOT_SETUP.md](docs/BOOT_SETUP.md), and [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for detailed instructions.
+
+## Keyboard cover touchpad
+
+The MateBook E Go keyboard cover (USB 12d1:10b8) requires `HID_QUIRK_NO_INIT_REPORTS` to function properly. Without this quirk, the HID subsystem sends `GET_REPORT` requests during initialization that return empty responses, blocking the control transfer queue and preventing `hid-multitouch` from setting the touchpad's Input Mode.
+
+Add to your kernel command line:
+
+```
+usbhid.quirks=0x12d1:0x10b8:0x20000000
+```
+
+This sets `HID_QUIRK_NO_INIT_REPORTS` (BIT(29) = 0x20000000) for the Huawei keyboard cover. The keyboard works without this quirk; only the touchpad is affected.
+
+## WiFi (WCN6855 / ath11k)
+
+WiFi works via `ath11k_pci`. If `CONFIG_PCI_PWRCTRL=y` is built into the kernel, delete the duplicate module to avoid a symbol conflict:
+
+```bash
+rm /usr/lib/modules/$(uname -r)/kernel/drivers/pci/pwrctrl/pci-pwrctrl-core.ko
+depmod -a
+```
+
+Auto-load WiFi modules by creating `/etc/modules-load.d/wifi.conf`:
+
+```
+pci-pwrctrl-pwrseq
+ath11k_pci
+```
 
 ## Current status
 
 - Display: working (1600x2560 @ 60 Hz, hardware-accelerated via MSM DRM)
 - Backlight: working (DSI-controlled)
 - fbcon: working (with `fbcon=rotate:1` for portrait panel)
-- Touchscreen: untested
+- Keyboard cover: working (keyboard + touchpad with usbhid quirk)
+- WiFi: working (WCN6855 / ath11k_pci)
+- Touchscreen: not working (I2C bus timeout on i2c@990000)
 - GPU acceleration (Adreno): untested beyond basic modesetting
 
 ## Acknowledgements
