@@ -15,10 +15,11 @@ Native GPU-accelerated display driver for the Huawei MateBook E Go, the first wo
 ## What's included
 
 - **Panel driver** (`panel-driver/`) -- standalone kernel module for the HX83121A panel with DTB overlay loader
-- **Kernel patches** (`kernel-patches/`) -- 4 patches against Linux 6.18.8 fixing clock, DPU, and bridge bugs
+- **Kernel patches** (`kernel-patches/`) -- 5 patches against Linux 6.18.8 fixing clock, DPU, bridge, and Bluetooth bugs
 - **Device tree** (`device-tree/`) -- DTS source and pre-built DTB for the MateBook E Go
 - **Boot configs** (`boot/`) -- reference GRUB and mkinitcpio configurations
 - **Touchpad activation** (`tools/touchpad/`) -- systemd service + script for keyboard cover touchpad
+- **Bluetooth fix** (`tools/bluetooth/`) -- NVM firmware patcher for WCN6855 BD address
 - **Diagnostic tool** (`tools/`) -- userspace tool to read DPU/DSC/INTF/DSI hardware registers
 
 ## Bug fixes
@@ -117,6 +118,31 @@ systemctl enable huawei-touchpad.service
 
 The service runs before the display manager at `sysinit.target`, ensuring the touchpad is ready when GNOME/Wayland starts.
 
+## Bluetooth (WCN6855 / btqca)
+
+The WCN6855 Bluetooth controller ships with a partially invalid BD address (`ad:5a:00:00:00:00`) in its NVM firmware. Additionally, the kernel's `btqca` driver incorrectly marks the controller as `HCI_UNCONFIGURED` even when a valid address is present in the NVM. Two fixes are required:
+
+### 1. Kernel patch
+
+Apply `kernel-patches/0005-bluetooth-btqca-fix-USE_BDADDR_PROPERTY-for-valid-NVM-address.patch`. This changes `qca_check_bdaddr()` to only set `HCI_QUIRK_USE_BDADDR_PROPERTY` when the BD address is all-zero (`BDADDR_ANY`), rather than whenever it matches the NVM file. Without this patch, the controller stays in `HCI_UNCONFIGURED` state and `btmgmt info` shows 0 controllers.
+
+### 2. NVM firmware patch
+
+Patch the NVM firmware with a valid BD address derived from the device serial number:
+
+```bash
+sudo python3 tools/bluetooth/patch-nvm-bdaddr.py
+```
+
+This generates a stable, locally-administered unicast address from the MD5 hash of the device serial (`/sys/class/dmi/id/product_serial`) and writes it to the BD address tag (tag_id=2) in `/lib/firmware/qca/hpnv21g.b9f`. A backup of the original file is saved as `.orig`.
+
+Reboot after applying both fixes. Verify with:
+
+```bash
+btmgmt info          # Should show hci0 as Primary controller
+bluetoothctl show     # Should show Powered: yes
+```
+
 ## WiFi (WCN6855 / ath11k)
 
 WiFi works via `ath11k_pci`. If `CONFIG_PCI_PWRCTRL=y` is built into the kernel, delete the duplicate module to avoid a symbol conflict:
@@ -139,6 +165,7 @@ ath11k_pci
 - Backlight: working (DSI-controlled)
 - fbcon: working (with `fbcon=rotate:1` for portrait panel)
 - Keyboard cover: working (keyboard + touchpad with usbhid quirk + activation service)
+- Bluetooth: working (WCN6855 / btqca, with NVM patch + kernel patch)
 - WiFi: working (WCN6855 / ath11k_pci)
 - Touchscreen: not working (I2C bus timeout on i2c@990000)
 - GPU acceleration (Adreno): untested beyond basic modesetting

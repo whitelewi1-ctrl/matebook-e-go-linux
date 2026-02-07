@@ -1,6 +1,6 @@
 # Kernel Patches
 
-Four patches against Linux 6.18.8 required to bring up a dual-DSI DSC display on the Snapdragon 8cx Gen 3 (sc8280xp). All four are necessary for the Huawei MateBook E Go's HX83121A panel; patches 2-4 likely affect any sc8280xp DSC display.
+Five patches against Linux 6.18.8 for the Huawei MateBook E Go on Snapdragon 8cx Gen 3 (sc8280xp). Patches 1-4 are required for the dual-DSI DSC display (HX83121A panel); patch 5 fixes Bluetooth. Patches 2-4 likely affect any sc8280xp DSC display.
 
 ## Applying
 
@@ -99,3 +99,25 @@ data_width = DIV_ROUND_UP(p->width, 2);
 ```
 
 **Impact:** Any sc8280xp DSC display with wide-bus enabled and an odd compressed width. This is a direct consequence of patch 0003 (which correctly rounds up the width to 267).
+
+---
+
+## 0005 -- Bluetooth: btqca: fix USE_BDADDR_PROPERTY for valid NVM address
+
+**File:** `drivers/bluetooth/btqca.c`
+
+**Problem:** The WCN6855 Bluetooth controller stays in `HCI_UNCONFIGURED` state even after patching the NVM firmware with a valid BD address. `btmgmt info` shows 0 controllers.
+
+**Root cause:** `qca_check_bdaddr()` sets `HCI_QUIRK_USE_BDADDR_PROPERTY` whenever the controller's BD address matches the address stored in the NVM firmware. This tells the HCI stack to obtain the real address from the `local-bd-address` device tree property. On the MateBook E Go, no such DT property exists, so the controller remains unconfigured.
+
+The original check assumes that any NVM address is a factory placeholder that needs to be overridden by a device tree property. This is incorrect when the NVM has been patched with a valid, unique address.
+
+**Fix:** Only set the quirk when the controller reports `BDADDR_ANY` (all zeros), which unambiguously indicates an invalid address:
+
+```c
+- if (!bacmp(&bda->bdaddr, &config->bdaddr))
++ if (!bacmp(&bda->bdaddr, BDADDR_ANY))
+      hci_set_quirk(hdev, HCI_QUIRK_USE_BDADDR_PROPERTY);
+```
+
+**Impact:** Any QCA Bluetooth controller where the NVM firmware has been patched with a valid BD address but no `local-bd-address` device tree property is present. Must be used together with the NVM firmware patch (`tools/bluetooth/patch-nvm-bdaddr.py`).
