@@ -23,7 +23,7 @@
 #include <drm/drm_modes.h>
 #include <drm/drm_panel.h>
 
-// #define XBL /* use initial sequence code from XBL rather than one from the DSDT table */
+#define XBL /* use initial sequence code from XBL rather than one from the DSDT table */
 
 #define REFRESHRATE 60
 
@@ -69,17 +69,17 @@ static inline struct panel_info *to_panel_info(struct drm_panel *panel)
 	return container_of(panel, struct panel_info, panel);
 }
 
-static int gaokun_csot_init_sequence(struct panel_info *pinfo)
+static int gaokun_csot_init_on_dsi(struct mipi_dsi_device *dsi)
 {
-	struct mipi_dsi_device *dsi0 = pinfo->dsi[0];
-	struct mipi_dsi_multi_context ctx = { .dsi = dsi0 };
+	struct mipi_dsi_multi_context ctx = { .dsi = dsi };
 	int ret;
 
-	dev_info(&dsi0->dev, "=== Starting init sequence ===\n");
+	dev_info(&dsi->dev, "=== Starting init sequence ===\n");
 
 	mipi_dsi_dcs_write_seq_multi(&ctx, 0xb9, 0x83, 0x12, 0x1a, 0x55, 0x00);
 	if (ctx.accum_err) {
-		dev_err(&dsi0->dev, "First cmd (0xb9) failed: %d\n", ctx.accum_err);
+		dev_err(&dsi->dev, "First cmd (0xb9) failed: %d\n", ctx.accum_err);
+		return ctx.accum_err;
 	}
 	mipi_dsi_dcs_write_seq_multi(&ctx, 0xbd, 0x00);
 
@@ -164,54 +164,53 @@ static int gaokun_csot_init_sequence(struct panel_info *pinfo)
 	if (ctx.accum_err)
 		return ctx.accum_err;
 
-
-
-	ret = mipi_dsi_dcs_exit_sleep_mode(pinfo->dsi[0]); // 05 11 00
+	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
 	if (ret < 0) {
-		dev_err(&pinfo->dsi[0]->dev, "Failed to exit sleep mode: %d\n", ret);
+		dev_err(&dsi->dev, "Failed to exit sleep mode: %d\n", ret);
 		return ret;
 	}
-	msleep(140); // ff 8c
-
+	msleep(140);
 
 #ifdef XBL
-	ret = mipi_dsi_dcs_enter_sleep_mode(pinfo->dsi[0]); // 05 10 00
+	ret = mipi_dsi_dcs_enter_sleep_mode(dsi);
 	if (ret < 0) {
-		dev_err(&pinfo->dsi[0]->dev, "Failed to enter sleep mode: %d\n", ret);
+		dev_err(&dsi->dev, "Failed to enter sleep mode: %d\n", ret);
 		return ret;
 	}
 
-	msleep(120); // ff 78
+	msleep(120);
 
-	ret = mipi_dsi_dcs_exit_sleep_mode(pinfo->dsi[0]); // 05 11 00
+	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
 	if (ret < 0) {
-		dev_err(&pinfo->dsi[0]->dev, "Failed to exit sleep mode: %d\n", ret);
+		dev_err(&dsi->dev, "Failed to exit sleep mode: %d\n", ret);
 		return ret;
 	}
 
-	msleep(150); // ff 96
+	msleep(150);
 #endif
 
-	ret = mipi_dsi_dcs_set_display_on(pinfo->dsi[0]); // 05 29 00
-	if (ret < 0) {
-		dev_err(&pinfo->dsi[0]->dev, "Failed to set display on: %d\n", ret);
-		return ret;
-	}
-
-#ifdef XBL
-	ret = mipi_dsi_dcs_set_display_brightness(pinfo->dsi[0], 0xff04); // 39 51 04 ff
-	if (ret < 0) {
-		dev_err(&pinfo->dsi[0]->dev, "Failed to set display brightness: %d\n", ret);
-		return ret;
-	}
-#endif
-
-	mipi_dsi_dcs_write_seq_multi(&ctx, MIPI_DCS_WRITE_POWER_SAVE, 0x01); // 39 55 01
-	mipi_dsi_dcs_write_seq_multi(&ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x24); // 39 53 24
-	msleep(20);
-
-	dev_info(&dsi0->dev, "=== Init sequence done, accum_err=%d ===\n", ctx.accum_err);
+	dev_info(&dsi->dev, "=== Init sequence done (pre-DSC), accum_err=%d ===\n", ctx.accum_err);
 	return ctx.accum_err;
+}
+
+static int gaokun_csot_init_sequence(struct panel_info *pinfo)
+{
+	int ret;
+
+	/* Send init commands to DSI-0 (master) */
+	ret = gaokun_csot_init_on_dsi(pinfo->dsi[0]);
+	if (ret < 0)
+		return ret;
+
+	/* Send init commands to DSI-1 (slave) as well for dual-DSI */
+	if (pinfo->desc->is_dual_dsi && pinfo->dsi[1]) {
+		ret = gaokun_csot_init_on_dsi(pinfo->dsi[1]);
+		if (ret < 0)
+			dev_warn(&pinfo->dsi[1]->dev,
+				 "Init on DSI-1 failed: %d (continuing)\n", ret);
+	}
+
+	return 0;
 }
 
 static const struct drm_display_mode gaokun_csot_modes[] = {
@@ -328,21 +327,105 @@ static int hx83121a_prepare(struct drm_panel *panel)
 	dev_info(panel->dev, "Init sequence completed, ret=%d\n", ret);
 	msleep(120);
 
+	/*
+	 * Populate DSC parameters fully before sending PPS.
+	 * dsi_populate_dsc_params() in the DSI host hasn't been called yet
+	 * (it runs during encoder enable, after prepare), so the DSC config
+	 * only has the basic fields set by probe. We must compute all RC
+	 * parameters here so the PPS sent to the panel is valid.
+	 *
+	 * pic_width must be per-link (800) for dual-DSI, not full width.
+	 */
+	pinfo->dsc.pic_width = pinfo->dsc.slice_width;
+	pinfo->dsc.pic_height = pinfo->desc->modes[0].vdisplay;
+	pinfo->dsc.simple_422 = 0;
+	pinfo->dsc.convert_rgb = 1;
+	pinfo->dsc.vbr_enable = 0;
+
+	drm_dsc_set_const_params(&pinfo->dsc);
+	drm_dsc_set_rc_buf_thresh(&pinfo->dsc);
+	ret = drm_dsc_setup_rc_params(&pinfo->dsc, DRM_DSC_1_1_PRE_SCR);
+	if (ret) {
+		dev_err(panel->dev, "failed to setup DSC RC params: %d\n", ret);
+		return ret;
+	}
+	pinfo->dsc.initial_scale_value = drm_dsc_initial_scale_value(&pinfo->dsc);
+	pinfo->dsc.line_buf_depth = pinfo->dsc.bits_per_component + 1;
+
+	ret = drm_dsc_compute_rc_parameters(&pinfo->dsc);
+	if (ret) {
+		dev_err(panel->dev, "failed to compute DSC RC parameters: %d\n", ret);
+		return ret;
+	}
+
+	dev_info(panel->dev, "DSC config: pic=%dx%d slice=%dx%d chunk=%d bpp=%d\n",
+		 pinfo->dsc.pic_width, pinfo->dsc.pic_height,
+		 pinfo->dsc.slice_width, pinfo->dsc.slice_height,
+		 pinfo->dsc.slice_chunk_size,
+		 pinfo->dsc.bits_per_pixel >> 4);
+
 	/* Send DSC PPS */
 	drm_dsc_pps_payload_pack(&pps, &pinfo->dsc);
 
-	dev_dbg(panel->dev, "Sending DSC PPS\n");
-
 	ret = mipi_dsi_picture_parameter_set(pinfo->dsi[0], &pps);
 	if (ret < 0) {
-		dev_err(panel->dev, "failed to transmit PPS: %d\n", ret);
+		dev_err(panel->dev, "failed to transmit PPS to dsi0: %d\n", ret);
 		return ret;
 	}
 
 	ret = mipi_dsi_compression_mode(pinfo->dsi[0], true);
 	if (ret < 0) {
-		dev_err(&pinfo->dsi[0]->dev, "failed to enable compression mode: %d\n", ret);
+		dev_err(&pinfo->dsi[0]->dev, "failed to enable compression on dsi0: %d\n", ret);
 		return ret;
+	}
+
+	/* Send PPS and compression_mode to second DSI link as well */
+	if (pinfo->desc->is_dual_dsi) {
+		ret = mipi_dsi_picture_parameter_set(pinfo->dsi[1], &pps);
+		if (ret < 0)
+			dev_warn(panel->dev, "failed to transmit PPS to dsi1: %d\n", ret);
+
+		ret = mipi_dsi_compression_mode(pinfo->dsi[1], true);
+		if (ret < 0)
+			dev_warn(panel->dev, "failed to enable compression on dsi1: %d\n", ret);
+	}
+
+	/*
+	 * PPS was sent with per-link pic_width (800) for the panel's DSC
+	 * decoder. Now set the full panel width for the DPU DSC encoder.
+	 *
+	 * dpu_encoder_prep_dsc() runs during commit_planes (before
+	 * commit_modeset_enables where dsi_timing_setup would normally
+	 * set pic_width = hdisplay). With pic_width=800 and num_dsc=2,
+	 * it miscalculates enc_ip_w = 800/2 = 400 instead of 800,
+	 * and soft_slice_per_enc = 400/800 = 0 (integer truncation),
+	 * completely breaking DSC compression.
+	 */
+	pinfo->dsc.pic_width = pinfo->desc->modes[0].hdisplay;
+
+	dev_info(panel->dev, "DSC pic_width set to %d for DPU split-panel mode\n",
+		 pinfo->dsc.pic_width);
+
+	/* Display on must come AFTER PPS/compression for DSC panels */
+	ret = mipi_dsi_dcs_set_display_on(pinfo->dsi[0]);
+	if (ret < 0) {
+		dev_err(panel->dev, "Failed to set display on dsi0: %d\n", ret);
+		return ret;
+	}
+	if (pinfo->desc->is_dual_dsi) {
+		ret = mipi_dsi_dcs_set_display_on(pinfo->dsi[1]);
+		if (ret < 0)
+			dev_warn(panel->dev, "Failed to set display on dsi1: %d\n", ret);
+	}
+
+	ret = mipi_dsi_dcs_set_display_brightness(pinfo->dsi[0], 0xff04);
+	if (ret < 0)
+		dev_warn(panel->dev, "Failed to set display brightness: %d\n", ret);
+
+	{
+		struct mipi_dsi_multi_context ctx = { .dsi = pinfo->dsi[0] };
+		mipi_dsi_dcs_write_seq_multi(&ctx, MIPI_DCS_WRITE_POWER_SAVE, 0x01);
+		mipi_dsi_dcs_write_seq_multi(&ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x24);
 	}
 
 	msleep(120);
