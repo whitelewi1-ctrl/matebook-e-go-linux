@@ -167,7 +167,7 @@ ath11k_pci
 - Keyboard cover: working (keyboard + touchpad with usbhid quirk + activation service)
 - Bluetooth: working (WCN6855 / btqca, with NVM patch + kernel patch)
 - WiFi: working (WCN6855 / ath11k_pci)
-- Touchscreen: not working (I2C bus timeout on i2c@990000)
+- Touchscreen: not working (needs SPI driver, see [docs/TOUCHSCREEN.md](docs/TOUCHSCREEN.md))
 - GPU acceleration (Adreno): untested beyond basic modesetting
 
 ## Acknowledgements
