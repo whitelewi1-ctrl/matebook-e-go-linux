@@ -169,7 +169,7 @@ ath11k_pci
 - Keyboard cover: working (keyboard + touchpad with usbhid quirk + activation service)
 - Bluetooth: working (WCN6855 / btqca, with NVM patch + kernel patch)
 - WiFi: working (WCN6855 / ath11k_pci)
-- Touchscreen: not working (I2C read-only; firmware download blocked, see [docs/TOUCHSCREEN.md](docs/TOUCHSCREEN.md))
+- Touchscreen: not working (SPI+I2C communication OK, flash programmed, but code SRAM hardware write-protected and boot ROM not loading; see [docs/TOUCHSCREEN.md](docs/TOUCHSCREEN.md))
 - GPU acceleration (Adreno): untested beyond basic modesetting
 
 ## Acknowledgements
