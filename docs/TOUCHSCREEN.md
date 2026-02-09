@@ -1,8 +1,8 @@
 # Touchscreen Research Notes
 
-## Status: Not Working (I2C reads OK, writes blocked, firmware download impossible)
+## Status: Not Working (I2C partial writes OK, but code SRAM hardware read-only)
 
-The MateBook E Go's touchscreen uses the **Himax HX83121A** TDDI (Touch & Display Driver Integration) IC. It communicates over **I2C** (not SPI as initially thought). I2C AHB register reads work perfectly, but **all AHB writes via I2C are silently discarded**, making firmware download to SRAM impossible through this path.
+The MateBook E Go's touchscreen uses the **Himax HX83121A** TDDI (Touch & Display Driver Integration) IC. It communicates over **I2C** via an AHB bridge. After discovering the I2C password unlock sequence, we confirmed that **IC registers, FW registers, and data SRAM (0x20000000) are writable**, but **code SRAM (0x08000000) remains hardware read-only** via I2C. Since firmware code (~126KB) must be loaded into code SRAM, I2C firmware download is impossible. SPI is the only write path to code SRAM, but SPI lines are not physically connected on this device.
 
 ## Hardware
 
@@ -19,146 +19,204 @@ The MateBook E Go's touchscreen uses the **Himax HX83121A** TDDI (Touch & Displa
 | I2C SDA/SCL | GPIO 171/172 (qup4 function) |
 | Power supply | vreg_misc_3p3 (VCC3B), vreg_s10b |
 
-## Confirmed I2C Communication
+### ACPI-Defined Interfaces (from Windows DSDT)
 
-### What Works (I2C AHB Reads)
-- **IC ID**: 0x83121A00 at register 0x900000D0
-- **Chip Status**: 0x05 (ACTIVE) at 0x900000A8
-- **Handshake**: 0xF8 at 0x900000AC
-- **FW Version**: 0x4103C20F at 0x10007004
-- **HW ID**: 0x04390208 at 0x10007010
-- **Sensor Name**: "Gaok" (Gaokun) at 0x10007014
-- **Sorting Mode**: 0x9999 at 0x10007F04 — **IC is requesting firmware download**
-- **SRAM**: All 0x78 at 0x08000000 — firmware not loaded (zero-flash)
-- **Touch event data**: cmd 0x30 reads 56 bytes event buffer
-- **Burst read**: Works correctly for multi-register reads
+The DSDT defines three mutually exclusive touch interfaces, selected by firmware at boot:
 
-### What Does NOT Work (I2C AHB Writes)
-**ALL writes via I2C are silently discarded.** Tested exhaustively:
+| ACPI Device | HID | Bus | Description |
+|-------------|-----|-----|-------------|
+| THPA (HIMX0001) | SPI6 | GPIO 154-157, 12MHz | Main touch (SPI) |
+| THPB (HIMX0002) | SPI20 | GPIO 87-90, 12MHz | Stylus (SPI) |
+| HIMX (HIMX1234) | I2C4 | addr 0x4F, 1MHz | I2C HID (PNP0C50) |
 
-| Address Region | Purpose | Write Result |
-|---|---|---|
-| 0x08000000 | SRAM (firmware target) | FAIL - reads back 0x78787878 |
-| 0x10007xxx | FW registers | FAIL - values unchanged |
-| 0x900000xx | IC control registers | FAIL - values unchanged |
-| 0x80000xxx | SPI200 registers | FAIL |
-| 0x80050xxx | Flash controller | FAIL |
+**Note**: I2C HID address 0x4F is for HID event interface; 0x48 is for AHB bridge register/firmware access.
 
-**Tested write methods** (all failed):
-1. Standard: bus_cmd 0x0C=0x01 (direction=write), then 0x08=[data]
-2. After software reset (0x55 to 0x90000018) + AHB enable (0x11=0x01)
-3. After GPIO reset (gpio99 toggle) + AHB enable
-4. With WDT disable + flash reload disable
-5. With password (bus_cmd 0x31=0xA5)
-6. Skip direction cmd, write directly to 0x08
-7. Combined addr+data in one transaction
-8. Various direction values (0x01, 0x02, 0x03, 0x10, 0x80, 0xFF)
+## I2C AHB Bridge Protocol
 
-**Conclusion**: The I2C AHB bridge on this HX83121A variant appears to be hardware read-only.
-
-## SPI Investigation
-
-### SPI6 (GPIO 154-157) — FAILED
-- DTS modified: removed GPIO 154-157 from reserved, added spi6 pinctrl (qup6 function)
-- spi-geni-qcom driver probed successfully, /dev/spidev0.0 created
-- GPIO state confirmed correct: func=qup6(1), drive=6mA, CS output-high
-- **All SPI transfers return 0x00** regardless of mode (0-3), speed (100KHz-10MHz), or read method
-- **Conclusion**: GPIO 154-157 are likely NOT physically connected to the touch IC
-
-### SPI4 (GPIO 171-174) — N/A
-- GPIO 171-172 = I2C SDA/SCL (connected, confirmed working)
-- GPIO 173-174 = would be SPI CLK/CS, but spi-gpio test showed MISO stuck HIGH
-- GENI SE4 proto=3 (I2C), cannot be changed at runtime (no qupv3fw.elf on sc8280xp)
-- **Conclusion**: SE4 only has I2C lines connected, SPI lines (CLK/CS) not routed
-
-## Previous Incorrect Assumptions (Corrected)
-
-1. ~~"SPI, not I2C"~~ → **I2C works for reads, SPI doesn't work at all**
-2. ~~"i2cdetect shows no devices"~~ → **i2cdetect works after toggling reset GPIO**
-3. ~~"GENI SE supports both I2C and SPI"~~ → **SE4 is locked to I2C by bootloader**
-4. ~~"EGoTouchRev SPI protocol"~~ → **That's Windows SPBTESTTOOL framework framing, not raw SPI**
-
-## Zero-Flash Architecture
-
-The HX83121A is a "zero-flash" TDDI IC:
-- SRAM at 0x08000000 is empty (0x78 pattern) after boot
-- `sorting_mode = 0x9999` confirms IC is in "awaiting firmware" state
-- Firmware must be downloaded from host on every boot
-- **Problem**: firmware download requires SRAM writes, which don't work over I2C
-
-### Extracted Firmware
-- **Source**: `himax_thp_drv.dll` from Windows driver package
-- **File**: `/tmp/gaokun_thp/hx83121a_gaokun_fw.bin` (261,120 bytes)
-- **Variant**: Gaokun-specific (contains "Gaok" sensor string)
-- **Structure**: Standard Himax zero-flash format with CRC sections
-
-## AHB Bridge Protocol (I2C)
-
-The bus command protocol is identical to EGoTouchRev's SPI protocol but over I2C:
+### Bus Commands
 
 ```
 Bus Commands (first byte of I2C write):
-  0x00 [addr3 addr2 addr1 addr0]  - Set AHB target address (LITTLE ENDIAN!)
-  0x08 [data...]                   - Read/write data
-  0x0C [dir]                       - Direction: 0x00=read, 0x01=write (writes don't work)
-  0x0D [val]                       - INCR4: 0x10=enable
-  0x11 [val]                       - AHB enable: 0x01
-  0x13 [val]                       - CONTI: 0x31=enable
-  0x30                             - Read event data (56 bytes)
-  0x31 [val]                       - Safe mode / password
-
-Read sequence:
-  burst_enable() → bus_write(0x00, LE_addr) → bus_write(0x0C, 0x00) → bus_read(0x08, N)
-
-Write sequence (DOES NOT WORK on this IC):
-  burst_enable() → bus_write(0x00, LE_addr) → bus_write(0x0C, 0x01) → bus_write(0x08, data)
+  0x00 [addr_LE(4B)] [data_LE(4B)]  - AHB address + optional write data (combined format)
+  0x08 [data...]                      - Read data register
+  0x0C [dir]                          - Direction: 0x00=read (for 3-step read)
+  0x0D [val]                          - INCR4: 0x12=enable (NOTE: 0x12 for HX83121, not 0x10!)
+  0x11 [val]                          - AHB enable: 0x01
+  0x13 [val]                          - CONTI: 0x31=enable
+  0x30                                - Read event data (56 bytes)
+  0x31 [val]                          - I2C password byte 1 (0x27 for safe mode)
+  0x32 [val]                          - I2C password byte 2 (0x95 for safe mode)
 ```
+
+### AHB Read Sequence (3-step)
+```
+burst_enable()  →  i2c_write([0x00] + addr_LE)
+                →  i2c_write([0x0C, 0x00])         # direction = read
+                →  i2c_write_read([0x08], 4)        # read 4 bytes
+```
+
+### AHB Write Sequence (combined format)
+```
+burst_enable()  →  i2c_write([0x00] + addr_LE + data_LE)   # 9 bytes total
+```
+
+**Important**: Writes use the "combined format" — address and data in a single I2C transaction with bus command 0x00. The 3-step write method (direction=0x01 + cmd 0x08) does NOT work.
+
+### Burst Enable
+```
+i2c_write([0x13, 0x31])   # CONTI enable
+i2c_write([0x0D, 0x12])   # INCR4 enable (0x12 for HX83121!)
+```
+
+### I2C Password Unlock (Safe Mode Entry)
+```
+i2c_write([0x31, 0x27])   # password byte 1
+i2c_write([0x32, 0x95])   # password byte 2
+# Wait 50ms, then verify: chip_status (0x900000A8) byte0 == 0x0C
+```
+
+After password unlock, IC registers, FW registers, and data SRAM become writable.
+
+## AHB Writability Map (After Password Unlock)
+
+| Address Region | Size | Read | Write | Purpose |
+|---|---|---|---|---|
+| 0x00000000 - 0x0001FFFF | 128KB | OK | **NO** | Boot ROM (read-only) |
+| 0x08000000 - 0x0801FFFF | 128KB | OK | **NO** | Code SRAM (firmware target) |
+| 0x10007000 - 0x10007FFF | 4KB | OK | **YES** | FW config registers |
+| 0x20000000 - 0x2001FFFF | 128KB | OK | **YES** | Data SRAM |
+| 0x80020000 - 0x80050xxx | varies | OK | **YES** | TCON / SPI200 / Flash controller |
+| 0x90000000 - 0x900000FF | 256B | OK | **YES** | IC control registers |
+| 0xE000E000 - 0xE000EFFF | 4KB | **NO** (returns 0) | **NO** | Cortex-M PPB (not accessible via AHB bridge) |
+
+### Code SRAM: Exhaustive Write Testing
+
+All of the following methods were tested and **none** could write to code SRAM (0x08000000):
+
+1. Combined write `[0x00][addr][data]` after password unlock
+2. All bus commands 0x00-0x16 with addr+data payload
+3. Direction=0x01 + cmd 0x08 (3-step write)
+4. After system reset (0x55 to 0x90000018) + safe mode
+5. After TCON reset + ADC reset (sense_off sequence)
+6. With activ_relod register = 0xEC
+7. With disable_flash_reload = 0x9AA9
+8. Via slave address 0x49 (same IC, same restriction)
+9. Without burst mode
+10. All INCR4 values (0x00-0xFF)
+11. SPI200 indirect write
+12. Writing to 0x00000xxx (boot ROM alias) — different memory, also read-only
+13. Cortex-M VTOR remapping to 0x20000000 — PPB registers not accessible
+
+**Conclusion**: Code SRAM is hardware read-only via the I2C AHB bridge. This is a silicon-level restriction, not a software/configuration issue.
+
+### Data SRAM: Writable (with limitations)
+
+Data SRAM at 0x20000000 (128KB) IS writable via I2C:
+- **Single-word (4B) writes**: 100% reliable (verified 256/256 consecutive writes)
+- **Burst writes**: Fail (only last word takes effect)
+- **Write speed**: ~3,300 bytes/sec (limited by I2C transaction overhead)
+- **Region size**: 128KB (0x20000000 - 0x2001FFFF)
+- **Not aliased**: 0x20000000 and 0x08000000 are separate memory regions
+
+## Firmware Analysis
+
+### Firmware Binary
+- **File**: `hx83121a_gaokun_fw.bin` (261,120 bytes / 0x3FC00)
+- **Source**: Extracted from Windows `himax_thp_drv.dll` driver
+- **Header**: "HX83121-A", date 2022-09-27
+- **Variant**: Gaokun-specific (contains "Gaok" sensor string)
+
+### Partition Table (at firmware offset 0x20030)
+
+Format: 16-byte header + 16-byte entries: `[sram_addr(4)][size(4)][fw_offset(4)][flags(4)]`
+
+| # | SRAM Address | Size | FW Offset | Type |
+|---|---|---|---|---|
+| 0 | 0x00000400 | 8,192 | 0x00080 | Code (→ 0x08000400) |
+| 1 | 0x00002400 | 109,568 | 0x02080 | Code (→ 0x08002400) |
+| 2 | 0x0001CE00 | 5,376 | 0x1C880 | Code (→ 0x0801CE00) |
+| 3 | 0x0001E300 | 5,376 | 0x1DD80 | Code (→ 0x0801E300) |
+| 4 | 0x0001F800 | 1,024 | 0x1F280 | Code (→ 0x0801F800) |
+| 5 | 0x10007000 | 120 | 0x1F680 | Config (FW regs) |
+| 6 | 0x10007084 | 528 | 0x1F700 | Config (FW regs) |
+| 7 | 0x10007300 | 180 | 0x1F910 | Config (FW regs) |
+| 8 | 0x100072F0 | 16 | 0x1F9C8 | Config (FW regs) |
+| 9 | 0x100073F0 | 32 | 0x1F9D8 | Config (FW regs) |
+
+- **Code partitions (0-4)**: ~126KB total → must go to code SRAM (0x08000xxx) — **NOT writable via I2C**
+- **Config partitions (5-9)**: ~876 bytes total → go to FW registers (0x10007xxx) — writable via I2C
+
+**Note**: Partition table addresses (0x00000400 etc.) map to code SRAM. The Xiaomi hxchipset driver source confirms these addresses go to SRAM region 0x08000xxx on the Cortex-M memory map.
 
 ## Key Register Map
 
 | Register | Address | Read Value | Purpose |
 |----------|---------|------------|---------|
 | IC ID | 0x900000D0 | 0x83121A00 | Chip identification |
-| Chip Status | 0x900000A8 | 0x05 | 0x05=ACTIVE |
+| Chip Status | 0x900000A8 | 0x05/0x0C | 0x05=ACTIVE, 0x0C=SAFE_MODE |
 | Handshake | 0x900000AC | 0xF8 | Boot handshake |
-| System Reset | 0x90000018 | - | Write 0x55 for reset (if writes worked) |
-| FW ISR Control | 0x9000005C | - | Write 0xA5 for FW stop |
+| System Reset | 0x90000018 | writable | Write 0x55 to reset touch IC CPU |
+| FW ISR Control | 0x9000005C | writable | Write 0xA5 for FW stop |
 | FW Version | 0x10007004 | 0x4103C20F | Firmware version |
 | HW ID | 0x10007010 | 0x04390208 | Hardware ID |
 | Sensor Name | 0x10007014 | "Gaok" | Sensor variant |
-| Sorting Mode | 0x10007F04 | 0x9999 | 0x9999=awaiting FW |
-| Flash Reload | 0x100072C0 | varies | Reload status |
+| Sorting Mode | 0x10007F04 | 0x9999 | 0x9999=awaiting FW, 0x0909=after reset |
+| Flash Reload | 0x10007F00 | varies | Write 0x9AA9 to disable flash reload |
 | SRAM Base | 0x08000000 | 0x78787878 | Firmware target (empty) |
+| Data SRAM | 0x20000000 | varies | Writable 128KB data SRAM |
+
+## SPI Investigation
+
+### SPI6 (GPIO 154-157) — NOT CONNECTED
+- DTS modified: removed GPIO 154-157 from reserved, added spi6 pinctrl (qup6 function)
+- spi-geni-qcom driver probed successfully, /dev/spidev0.0 created
+- GPIO state confirmed correct: func=qup6(1), drive=6mA, CS output-high
+- **All SPI transfers return 0x00** regardless of mode (0-3), speed (100KHz-10MHz)
+- **Conclusion**: GPIO 154-157 are NOT physically connected to the touch IC
+
+### SPI20 (GPIO 87-90) — NOT CONNECTED
+- GPIO state: mux=0 (GPIO mode), not configured for any QUP function
+- **Conclusion**: Not connected, likely for optional stylus digitizer
+
+### SPI4 (GPIO 171-174) — I2C ONLY
+- GPIO 171-172 = I2C SDA/SCL (connected, confirmed working)
+- GENI SE4 proto=3 (I2C), cannot be changed at runtime (no qupv3fw.elf on sc8280xp)
+- **Conclusion**: SE4 only has I2C lines connected
 
 ## Possible Next Approaches
 
-### Approach 1: I2C HID Protocol
-The HX83121A might support I2C HID natively when firmware IS loaded (by UEFI).
-- UEFI loads touch firmware during boot → touch works in UEFI
-- If Linux panel driver skips re-init (skip_init=1), UEFI FW stays active
-- Try reading I2C HID descriptor from register 0x0001
-- Script: `/tmp/touch_i2c_hid_test.py` (not yet run)
+### Approach A: Dual-Boot Warm Reboot
+Windows loads touch firmware into SRAM on every boot. If we:
+1. Boot Windows (firmware loaded into code SRAM)
+2. Warm reboot to Linux without resetting GPIO 99
+3. Code SRAM may retain firmware content
 
-### Approach 2: Preserve UEFI Touchscreen State
-- Boot with panel driver `skip_init=1` to avoid re-initializing the TDDI
-- UEFI already downloads firmware and enables touch
-- The I2C HID interface might already be active
-- Risk: display timing might not match Linux expectations
+**Risk**: SRAM content may not survive warm reboot; UEFI may reset touch IC.
 
-### Approach 3: DSI Command-Based Firmware Download
-- The panel driver already sends DSI commands successfully to both links
-- The HX83121A might accept firmware data via DSI generic/DCS commands
-- This bypasses the I2C AHB write limitation entirely
-- Needs research into Himax DSI firmware download protocol
+### Approach B: UEFI Application
+Write a custom UEFI application that:
+1. Opens the I2C controller in SPI mode (or uses raw MMIO)
+2. Downloads firmware to code SRAM before Linux boots
+3. Uses the SPI protocol which CAN write to code SRAM
 
-### Approach 4: Investigate Windows Driver More Deeply
-- Check if Windows himax_thp_drv.dll uses a different I2C write mechanism
-- Check if there's an I2C "unlock" sequence before writes
-- Check if Windows uses DMA or a different bus master for SRAM writes
+**Advantage**: Runs before Linux, can use any hardware interface.
+**Challenge**: UEFI SPI access on sc8280xp is undocumented.
 
-### Approach 5: Contact linux-gaokun Maintainers
-- The gaokun3 DTS already has touch IC entries, implying someone has worked on this
-- Ask about their touchscreen experience and any unlisted patches
+### Approach C: Re-examine SPI Physical Connections
+- Use multimeter/oscilloscope to trace GPIO 154-157 physical routes
+- Check if there's an alternate QUP/GPIO combination for SPI to the touch IC
+- The ACPI DSDT says THPA uses SPI6 — firmware expects it to work
+
+### Approach D: Community / Upstream Progress
+- The [linux-gaokun](https://github.com/right-0903/linux-gaokun) project tracks MateBook E Go Linux support
+- Wait for upstream Himax TDDI driver with firmware download support
+- Contribute findings to help others working on this device
+
+### Approach E: I2C HID (Partial Touch Without FW Download)
+- UEFI may leave touch active if we don't reset the TDDI
+- I2C HID descriptor at address 0x4F, register 0x0001
+- Requires `skip_init=1` in panel driver to avoid re-initializing TDDI
+- **Risk**: Display timing might not match; UEFI may not initialize touch on every boot
 
 ## TDDI Coupling Warning
 
@@ -175,51 +233,10 @@ GNOME/GDM has a 5-minute screen timeout that triggers DPMS Off, which crashes th
 - `consoleblank=0` kernel parameter only affects fbcon, not enough
 - Must disable GDM (`systemctl disable gdm`) during touchscreen debugging
 - Or use `xset s off -dpms` / `gsettings set org.gnome.desktop.session idle-delay 0`
-- Service `/etc/systemd/system/disable-blanking.service` prevents console blanking
-
-## DTS Changes Made (2026-02-09)
-
-```dts
-/* 1. Removed GPIO 154-157 from reserved ranges */
-gpio-reserved-ranges = <70 2>, <74 6>, <83 4>, <125 2>, <128 2>;
-/* was: ... <128 2>, <154 4>; */
-
-/* 2. Added spi6 pinctrl */
-spi6_default: spi6-default-state {
-    spi-pins {
-        pins = "gpio154", "gpio155", "gpio156";
-        function = "qup6";
-        drive-strength = <6>;
-        bias-disable;
-    };
-    cs-pins {
-        pins = "gpio157";
-        function = "qup6";
-        drive-strength = <6>;
-        bias-disable;
-        output-high;
-    };
-};
-
-/* 3. Enabled spi6 with spidev */
-&spi6 {
-    pinctrl-0 = <&spi6_default>;
-    pinctrl-names = "default";
-    status = "okay";
-    spidev@0 {
-        compatible = "rohm,dh2228fv";
-        reg = <0>;
-        spi-max-frequency = <10000000>;
-    };
-};
-```
-
-**Result**: SPI6 probed but returns all zeros. These changes may need to be reverted.
 
 ## References
 
 - [EGoTouchRev-rebuild](https://github.com/awarson2233/EGoTouchRev-rebuild) — Windows userspace driver with reverse-engineered SPI protocol
-- `drivers/input/touchscreen/himax_hx83112b.c` — Kernel Himax I2C driver (related IC)
-- `drivers/input/touchscreen/himax_hx852x.c` — Simpler Himax I2C driver
-- `drivers/hid/hid-goodix-spi.c` — Example SPI touchscreen HID driver
+- [MiCode/Xiaomi_Kernel_OpenSource (dagu-s-oss)](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/tree/dagu-s-oss/drivers/input/touchscreen/hxchipset) — Himax hxchipset driver with full firmware download implementation
+- `drivers/input/touchscreen/himax_hx83112b.c` — Kernel Himax I2C driver (no FW download)
 - Himax HX83121A — Display + touch integrated controller IC (TDDI)
