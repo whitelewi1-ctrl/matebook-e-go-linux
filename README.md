@@ -24,7 +24,7 @@ Native GPU-accelerated display driver for the Huawei MateBook E Go, the first wo
 
 ## Bug fixes
 
-Getting this panel working required fixing 6 bugs across 5 kernel subsystems. The 4 kernel patches address issues that affect any sc8280xp DSC dual-DSI display; the remaining 2 fixes are in the panel driver itself. An additional patch fixes EC suspend/resume.
+Getting this panel working required fixing 7 bugs across 5 kernel subsystems. The 4 kernel patches address issues that affect any sc8280xp DSC dual-DSI display; the remaining 3 fixes are in the panel driver itself. An additional patch fixes EC suspend/resume.
 
 1. **aux-bridge: handle missing endpoint** -- USB-C PHYs with DP alt-mode but no display output cause probe failure; return 0 on `-ENODEV` instead.
 
@@ -37,6 +37,8 @@ Getting this panel working required fixing 6 bugs across 5 kernel subsystems. Th
 5. **Panel driver: DSC init ordering** -- `display_on` must be sent *after* PPS and compression mode are configured, not before.
 
 6. **Panel driver: dual-link init** -- The HX83121A requires the full init sequence (vendor commands + sleep out + PPS + compression + display_on) to be sent on *both* DSI links.
+
+7. **Panel driver: dual-link brightness tearing** -- Setting brightness via DCS 0x51 on two DSI links sequentially creates a time gap where left and right halves display different brightness, causing a visible seam. The fix uses software brightness ramping: instead of jumping directly to the target, the driver steps by 64/4095 (~1.6%) every 16 ms via a delayed workqueue. The small per-step change makes the dual-link timing gap imperceptible.
 
 ## Quick start
 
@@ -162,7 +164,7 @@ ath11k_pci
 ## Current status
 
 - Display: working (1600x2560 @ 60 Hz, hardware-accelerated via MSM DRM)
-- Backlight: working (DSI-controlled)
+- Backlight: working (DSI-controlled, software-ramped dual-link for tear-free adjustment)
 - fbcon: working (with `fbcon=rotate:1` for portrait panel)
 - Keyboard cover: working (keyboard + touchpad with usbhid quirk + activation service)
 - Bluetooth: working (WCN6855 / btqca, with NVM patch + kernel patch)

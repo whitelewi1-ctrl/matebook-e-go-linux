@@ -10,6 +10,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/workqueue.h>
 #include <linux/of_graph.h>
 #include <linux/regulator/consumer.h>
 
@@ -44,6 +45,12 @@ struct panel_info {
 	struct gpio_desc *reset_gpio;
 	struct backlight_device *backlight;
 	struct regulator *vddio;
+
+	/* Brightness ramping: gradually step to target to avoid visible
+	 * left/right seam on dual-DSI (two sequential commands per step). */
+	struct delayed_work bl_work;
+	u16 bl_target;
+	u16 bl_current;
 };
 
 struct panel_desc {
@@ -74,15 +81,8 @@ static int gaokun_csot_init_on_dsi(struct mipi_dsi_device *dsi)
 	struct mipi_dsi_multi_context ctx = { .dsi = dsi };
 	int ret;
 
-	dev_info(&dsi->dev, "=== Starting init sequence ===\n");
-
 	mipi_dsi_dcs_write_seq_multi(&ctx, 0xb9, 0x83, 0x12, 0x1a, 0x55, 0x00);
-	if (ctx.accum_err) {
-		dev_err(&dsi->dev, "First cmd (0xb9) failed: %d\n", ctx.accum_err);
-		return ctx.accum_err;
-	}
 	mipi_dsi_dcs_write_seq_multi(&ctx, 0xbd, 0x00);
-
 	mipi_dsi_dcs_write_seq_multi(&ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x24);
 	mipi_dsi_dcs_write_seq_multi(&ctx, 0xb1,
 			       0x1c, 0x6b, 0x6b, 0x27, 0xe7, 0x00, 0x1b, 0x25,
@@ -177,7 +177,6 @@ static int gaokun_csot_init_on_dsi(struct mipi_dsi_device *dsi)
 		dev_err(&dsi->dev, "Failed to enter sleep mode: %d\n", ret);
 		return ret;
 	}
-
 	msleep(120);
 
 	ret = mipi_dsi_dcs_exit_sleep_mode(dsi);
@@ -185,31 +184,35 @@ static int gaokun_csot_init_on_dsi(struct mipi_dsi_device *dsi)
 		dev_err(&dsi->dev, "Failed to exit sleep mode: %d\n", ret);
 		return ret;
 	}
-
 	msleep(150);
 #endif
 
-	dev_info(&dsi->dev, "=== Init sequence done (pre-DSC), accum_err=%d ===\n", ctx.accum_err);
+	mipi_dsi_dcs_write_seq_multi(&ctx, MIPI_DCS_WRITE_POWER_SAVE, 0x01);
+	mipi_dsi_dcs_write_seq_multi(&ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x24);
+
 	return ctx.accum_err;
 }
 
 static int gaokun_csot_init_sequence(struct panel_info *pinfo)
 {
-	int ret;
+	int i, ret;
 
-	/* Send init commands to DSI-0 (master) */
-	ret = gaokun_csot_init_on_dsi(pinfo->dsi[0]);
-	if (ret < 0)
-		return ret;
+	dev_info(&pinfo->dsi[0]->dev, "=== Starting init sequence ===\n");
 
-	/* Send init commands to DSI-1 (slave) as well for dual-DSI */
-	if (pinfo->desc->is_dual_dsi && pinfo->dsi[1]) {
-		ret = gaokun_csot_init_on_dsi(pinfo->dsi[1]);
-		if (ret < 0)
-			dev_warn(&pinfo->dsi[1]->dev,
-				 "Init on DSI-1 failed: %d (continuing)\n", ret);
+	/* Run full init on BOTH DSI links */
+	for (i = 0; i < 2; i++) {
+		if (!pinfo->dsi[i])
+			continue;
+		ret = gaokun_csot_init_on_dsi(pinfo->dsi[i]);
+		if (ret < 0) {
+			dev_err(&pinfo->dsi[i]->dev,
+				"Init failed on dsi[%d]: %d\n", i, ret);
+			return ret;
+		}
 	}
 
+	dev_info(&pinfo->dsi[0]->dev,
+		 "=== Init sequence done (pre-DSC), accum_err=0 ===\n");
 	return 0;
 }
 
@@ -294,7 +297,7 @@ static int hx83121a_prepare(struct drm_panel *panel)
 {
 	struct panel_info *pinfo = to_panel_info(panel);
 	struct drm_dsc_picture_parameter_set pps;
-	int ret;
+	int ret, i;
 
 	dev_info(panel->dev, "=== hx83121a_prepare called, skip_init=%d ===\n", skip_init);
 
@@ -327,108 +330,42 @@ static int hx83121a_prepare(struct drm_panel *panel)
 	dev_info(panel->dev, "Init sequence completed, ret=%d\n", ret);
 	msleep(120);
 
-	/*
-	 * Populate DSC parameters fully before sending PPS.
-	 * dsi_populate_dsc_params() in the DSI host hasn't been called yet
-	 * (it runs during encoder enable, after prepare), so the DSC config
-	 * only has the basic fields set by probe. We must compute all RC
-	 * parameters here so the PPS sent to the panel is valid.
-	 *
-	 * pic_width must be per-link (800) for dual-DSI, not full width.
-	 */
-	pinfo->dsc.pic_width = pinfo->dsc.slice_width;
-	pinfo->dsc.pic_height = pinfo->desc->modes[0].vdisplay;
-	pinfo->dsc.simple_422 = 0;
-	pinfo->dsc.convert_rgb = 1;
-	pinfo->dsc.vbr_enable = 0;
-
-	drm_dsc_set_const_params(&pinfo->dsc);
-	drm_dsc_set_rc_buf_thresh(&pinfo->dsc);
-	ret = drm_dsc_setup_rc_params(&pinfo->dsc, DRM_DSC_1_1_PRE_SCR);
-	if (ret) {
-		dev_err(panel->dev, "failed to setup DSC RC params: %d\n", ret);
-		return ret;
-	}
-	pinfo->dsc.initial_scale_value = drm_dsc_initial_scale_value(&pinfo->dsc);
-	pinfo->dsc.line_buf_depth = pinfo->dsc.bits_per_component + 1;
-
-	ret = drm_dsc_compute_rc_parameters(&pinfo->dsc);
-	if (ret) {
-		dev_err(panel->dev, "failed to compute DSC RC parameters: %d\n", ret);
-		return ret;
-	}
-
-	dev_info(panel->dev, "DSC config: pic=%dx%d slice=%dx%d chunk=%d bpp=%d\n",
-		 pinfo->dsc.pic_width, pinfo->dsc.pic_height,
-		 pinfo->dsc.slice_width, pinfo->dsc.slice_height,
-		 pinfo->dsc.slice_chunk_size,
-		 pinfo->dsc.bits_per_pixel >> 4);
-
-	/* Send DSC PPS */
+	/* Send DSC PPS + compression + display_on to BOTH DSI links */
 	drm_dsc_pps_payload_pack(&pps, &pinfo->dsc);
 
-	ret = mipi_dsi_picture_parameter_set(pinfo->dsi[0], &pps);
-	if (ret < 0) {
-		dev_err(panel->dev, "failed to transmit PPS to dsi0: %d\n", ret);
-		return ret;
-	}
+	for (i = 0; i < 2; i++) {
+		if (!pinfo->dsi[i])
+			continue;
 
-	ret = mipi_dsi_compression_mode(pinfo->dsi[0], true);
-	if (ret < 0) {
-		dev_err(&pinfo->dsi[0]->dev, "failed to enable compression on dsi0: %d\n", ret);
-		return ret;
-	}
+		ret = mipi_dsi_picture_parameter_set(pinfo->dsi[i], &pps);
+		if (ret < 0) {
+			dev_err(panel->dev, "failed to transmit PPS to dsi%d: %d\n", i, ret);
+			return ret;
+		}
 
-	/* Send PPS and compression_mode to second DSI link as well */
-	if (pinfo->desc->is_dual_dsi) {
-		ret = mipi_dsi_picture_parameter_set(pinfo->dsi[1], &pps);
-		if (ret < 0)
-			dev_warn(panel->dev, "failed to transmit PPS to dsi1: %d\n", ret);
+		ret = mipi_dsi_compression_mode(pinfo->dsi[i], true);
+		if (ret < 0) {
+			dev_err(panel->dev, "failed to enable compression on dsi%d: %d\n", i, ret);
+			return ret;
+		}
 
-		ret = mipi_dsi_compression_mode(pinfo->dsi[1], true);
-		if (ret < 0)
-			dev_warn(panel->dev, "failed to enable compression on dsi1: %d\n", ret);
-	}
-
-	/*
-	 * PPS was sent with per-link pic_width (800) for the panel's DSC
-	 * decoder. Now set the full panel width for the DPU DSC encoder.
-	 *
-	 * dpu_encoder_prep_dsc() runs during commit_planes (before
-	 * commit_modeset_enables where dsi_timing_setup would normally
-	 * set pic_width = hdisplay). With pic_width=800 and num_dsc=2,
-	 * it miscalculates enc_ip_w = 800/2 = 400 instead of 800,
-	 * and soft_slice_per_enc = 400/800 = 0 (integer truncation),
-	 * completely breaking DSC compression.
-	 */
-	pinfo->dsc.pic_width = pinfo->desc->modes[0].hdisplay;
-
-	dev_info(panel->dev, "DSC pic_width set to %d for DPU split-panel mode\n",
-		 pinfo->dsc.pic_width);
-
-	/* Display on must come AFTER PPS/compression for DSC panels */
-	ret = mipi_dsi_dcs_set_display_on(pinfo->dsi[0]);
-	if (ret < 0) {
-		dev_err(panel->dev, "Failed to set display on dsi0: %d\n", ret);
-		return ret;
-	}
-	if (pinfo->desc->is_dual_dsi) {
-		ret = mipi_dsi_dcs_set_display_on(pinfo->dsi[1]);
-		if (ret < 0)
-			dev_warn(panel->dev, "Failed to set display on dsi1: %d\n", ret);
-	}
-
-	ret = mipi_dsi_dcs_set_display_brightness(pinfo->dsi[0], 0xff04);
-	if (ret < 0)
-		dev_warn(panel->dev, "Failed to set display brightness: %d\n", ret);
-
-	{
-		struct mipi_dsi_multi_context ctx = { .dsi = pinfo->dsi[0] };
-		mipi_dsi_dcs_write_seq_multi(&ctx, MIPI_DCS_WRITE_POWER_SAVE, 0x01);
-		mipi_dsi_dcs_write_seq_multi(&ctx, MIPI_DCS_WRITE_CONTROL_DISPLAY, 0x24);
+		ret = mipi_dsi_dcs_set_display_on(pinfo->dsi[i]);
+		if (ret < 0) {
+			dev_err(panel->dev, "Failed to set display on dsi%d: %d\n", i, ret);
+			return ret;
+		}
 	}
 
 	msleep(120);
+
+#ifdef XBL
+	/* Set initial brightness on both links */
+	for (i = 0; i < 2; i++) {
+		if (!pinfo->dsi[i])
+			continue;
+		mipi_dsi_dcs_set_display_brightness(pinfo->dsi[i], 0xff04);
+	}
+#endif
 
 	return 0;
 }
@@ -463,9 +400,10 @@ static int hx83121a_unprepare(struct drm_panel *panel)
 
 static void hx83121a_remove(struct mipi_dsi_device *dsi)
 {
-
 	struct panel_info *pinfo = mipi_dsi_get_drvdata(dsi);
 	int ret;
+
+	cancel_delayed_work_sync(&pinfo->bl_work);
 
 	ret = mipi_dsi_detach(pinfo->dsi[0]);
 	if (ret < 0)
@@ -530,36 +468,80 @@ static const struct drm_panel_funcs hx83121a_panel_funcs = {
 	// .get_orientation = hx83121a_get_orientation,
 };
 
+/* Brightness ramping parameters.
+ * Step size controls the max brightness change per tick. Smaller = smoother
+ * but slower. 64 out of 4095 ≈ 1.6% per tick, invisible to the eye.
+ * Interval controls tick rate. 16ms ≈ 60fps animation. */
+#define BL_RAMP_STEP	64
+#define BL_RAMP_MS	16
+
+static void hx83121a_bl_send(struct panel_info *pinfo, u16 brightness)
+{
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		if (!pinfo->dsi[i])
+			continue;
+		mipi_dsi_dcs_set_display_brightness_large(pinfo->dsi[i],
+							  brightness);
+	}
+}
+
+static void hx83121a_bl_work(struct work_struct *work)
+{
+	struct panel_info *pinfo = container_of(work, struct panel_info,
+						bl_work.work);
+	u16 target = pinfo->bl_target;
+	u16 cur = pinfo->bl_current;
+	s32 diff = (s32)target - (s32)cur;
+
+	/* First update after probe — jump directly, don't ramp from zero */
+	if (cur == 0 && target > 0) {
+		cur = target;
+	} else if (diff > BL_RAMP_STEP) {
+		cur += BL_RAMP_STEP;
+	} else if (diff < -BL_RAMP_STEP) {
+		cur -= BL_RAMP_STEP;
+	} else {
+		cur = target;
+	}
+
+	pinfo->bl_current = cur;
+	hx83121a_bl_send(pinfo, cur);
+
+	/* Keep ramping if not at target yet */
+	if (cur != pinfo->bl_target)
+		schedule_delayed_work(&pinfo->bl_work,
+				     msecs_to_jiffies(BL_RAMP_MS));
+}
+
 static int hx83121a_bl_update_status(struct backlight_device *bl)
 {
-	struct mipi_dsi_device *dsi = bl_get_data(bl);
+	struct panel_info *pinfo = bl_get_data(bl);
 	u16 brightness = backlight_get_brightness(bl);
-	int ret;
 
-	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	pinfo->bl_target = brightness;
 
-	ret = mipi_dsi_dcs_set_display_brightness_large(dsi, brightness);
-	if (ret < 0)
-		return ret;
-
-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
-
+	/* Kick the ramp if not already running */
+	if (!delayed_work_pending(&pinfo->bl_work))
+		schedule_delayed_work(&pinfo->bl_work,
+				     msecs_to_jiffies(BL_RAMP_MS));
 	return 0;
 }
 
 static int hx83121a_bl_get_brightness(struct backlight_device *bl)
 {
-	struct mipi_dsi_device *dsi = bl_get_data(bl);
+	struct panel_info *pinfo = bl_get_data(bl);
 	u16 brightness;
 	int ret;
 
-	dsi->mode_flags &= ~MIPI_DSI_MODE_LPM;
+	pinfo->dsi[0]->mode_flags &= ~MIPI_DSI_MODE_LPM;
 
-	ret = mipi_dsi_dcs_get_display_brightness_large(dsi, &brightness);
+	ret = mipi_dsi_dcs_get_display_brightness_large(pinfo->dsi[0], &brightness);
 	if (ret < 0)
 		return ret;
 
-	dsi->mode_flags |= MIPI_DSI_MODE_LPM;
+	pinfo->dsi[0]->mode_flags |= MIPI_DSI_MODE_LPM;
 
 	return brightness;
 }
@@ -569,7 +551,8 @@ static const struct backlight_ops hx83121a_bl_ops = {
 	.get_brightness = hx83121a_bl_get_brightness,
 };
 
-static struct backlight_device *hx83121a_create_backlight(struct mipi_dsi_device *dsi)
+static struct backlight_device *hx83121a_create_backlight(struct mipi_dsi_device *dsi,
+							  struct panel_info *pinfo)
 {
 	struct device *dev = &dsi->dev;
 	const struct backlight_properties props = {
@@ -579,7 +562,7 @@ static struct backlight_device *hx83121a_create_backlight(struct mipi_dsi_device
 		.scale = BACKLIGHT_SCALE_NON_LINEAR,
 	};
 
-	return devm_backlight_device_register(dev, dev_name(dev), dev, dsi,
+	return devm_backlight_device_register(dev, dev_name(dev), dev, pinfo,
 					      &hx83121a_bl_ops, &props);
 }
 
@@ -665,8 +648,10 @@ static int hx83121a_probe(struct mipi_dsi_device *dsi)
 
 	pinfo->panel.prepare_prev_first = true;
 
+	INIT_DELAYED_WORK(&pinfo->bl_work, hx83121a_bl_work);
+
 	if (pinfo->desc->has_dcs_backlight) {
-		pinfo->panel.backlight = hx83121a_create_backlight(dsi);
+		pinfo->panel.backlight = hx83121a_create_backlight(dsi, pinfo);
 		if (IS_ERR(pinfo->panel.backlight))
 			return dev_err_probe(dev, PTR_ERR(pinfo->panel.backlight),
 								 "Failed to create backlight\n");
