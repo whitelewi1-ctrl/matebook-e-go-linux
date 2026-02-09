@@ -1,160 +1,225 @@
 # Touchscreen Research Notes
 
-## Status: Not Working (SPI driver needed)
+## Status: Not Working (I2C reads OK, writes blocked, firmware download impossible)
 
-The MateBook E Go's touchscreen uses the **Himax HX83121A** touch controller IC (integrated into the display driver IC). It communicates over **SPI**, not I2C. The current DTS incorrectly configures it as HID-over-I2C, and the touch IC does not respond on the I2C bus.
+The MateBook E Go's touchscreen uses the **Himax HX83121A** TDDI (Touch & Display Driver Integration) IC. It communicates over **I2C** (not SPI as initially thought). I2C AHB register reads work perfectly, but **all AHB writes via I2C are silently discarded**, making firmware download to SRAM impossible through this path.
 
 ## Hardware
 
 | Parameter | Value |
 |-----------|-------|
-| Touch IC | Himax HX83121A (same IC as display driver) |
-| Bus | **SPI** (GENI SE4 at 0x990000) |
+| Touch IC | Himax HX83121A (same IC as display driver - TDDI) |
+| Bus | **I2C** via GENI SE4 at 0x990000 (proto=3=I2C, set by bootloader) |
+| I2C Addresses | 0x48 (Master IC), 0x49 (Slave IC) |
 | Architecture | Master/Slave dual-IC |
 | Touch matrix | 36 RX x 18 TX electrodes |
 | Max touch points | 10 |
 | Interrupt GPIO | tlmm 175 (active low) |
-| Reset GPIO | tlmm 99 (active low) |
+| Reset GPIO | tlmm 99 (active low) — **WARNING: resets display too (TDDI)** |
+| I2C SDA/SCL | GPIO 171/172 (qup4 function) |
 | Power supply | vreg_misc_3p3 (VCC3B), vreg_s10b |
 
-## Evidence That It's SPI, Not I2C
+## Confirmed I2C Communication
 
-1. **i2cdetect shows no devices** on i2c-4 (bus at 0x990000) -- the touch IC does not ACK any I2C address
-2. **Windows driver uses SPI** -- Huawei's `HuaweiThpService.exe` communicates via `SPBTESTTOOL` kernel driver using SPI opcodes (0xF2/0xF3 for Master, 0xF4/0xF5 for Slave)
-3. **The GENI SE at 0x990000 supports both I2C and SPI** -- only one mode can be active. The DTS currently enables `i2c@990000` and disables `spi@990000`
-4. **The [EGoTouchRev-rebuild](https://github.com/awarson2233/EGoTouchRev-rebuild) project** successfully communicates with the touch IC using SPI on Windows
+### What Works (I2C AHB Reads)
+- **IC ID**: 0x83121A00 at register 0x900000D0
+- **Chip Status**: 0x05 (ACTIVE) at 0x900000A8
+- **Handshake**: 0xF8 at 0x900000AC
+- **FW Version**: 0x4103C20F at 0x10007004
+- **HW ID**: 0x04390208 at 0x10007010
+- **Sensor Name**: "Gaok" (Gaokun) at 0x10007014
+- **Sorting Mode**: 0x9999 at 0x10007F04 — **IC is requesting firmware download**
+- **SRAM**: All 0x78 at 0x08000000 — firmware not loaded (zero-flash)
+- **Touch event data**: cmd 0x30 reads 56 bytes event buffer
+- **Burst read**: Works correctly for multi-register reads
 
-## SPI Protocol (from EGoTouchRev reverse engineering)
+### What Does NOT Work (I2C AHB Writes)
+**ALL writes via I2C are silently discarded.** Tested exhaustively:
 
-### Bus Framing
+| Address Region | Purpose | Write Result |
+|---|---|---|
+| 0x08000000 | SRAM (firmware target) | FAIL - reads back 0x78787878 |
+| 0x10007xxx | FW registers | FAIL - values unchanged |
+| 0x900000xx | IC control registers | FAIL - values unchanged |
+| 0x80000xxx | SPI200 registers | FAIL |
+| 0x80050xxx | Flash controller | FAIL |
 
-Each SPI transaction starts with an opcode byte:
+**Tested write methods** (all failed):
+1. Standard: bus_cmd 0x0C=0x01 (direction=write), then 0x08=[data]
+2. After software reset (0x55 to 0x90000018) + AHB enable (0x11=0x01)
+3. After GPIO reset (gpio99 toggle) + AHB enable
+4. With WDT disable + flash reload disable
+5. With password (bus_cmd 0x31=0xA5)
+6. Skip direction cmd, write directly to 0x08
+7. Combined addr+data in one transaction
+8. Various direction values (0x01, 0x02, 0x03, 0x10, 0x80, 0xFF)
 
-| Opcode | Direction | Target |
-|--------|-----------|--------|
-| 0xF2 | Write | Master |
-| 0xF3 | Read | Master |
-| 0xF4 | Write | Slave |
-| 0xF5 | Read | Slave |
+**Conclusion**: The I2C AHB bridge on this HX83121A variant appears to be hardware read-only.
 
-**Read format**: `[opcode] [cmd] [dummy] [data...]`
-**Write format**: `[opcode] [cmd] [addr(4, optional)] [data...]`
+## SPI Investigation
 
-### Register Access via AHB Bridge
+### SPI6 (GPIO 154-157) — FAILED
+- DTS modified: removed GPIO 154-157 from reserved, added spi6 pinctrl (qup6 function)
+- spi-geni-qcom driver probed successfully, /dev/spidev0.0 created
+- GPIO state confirmed correct: func=qup6(1), drive=6mA, CS output-high
+- **All SPI transfers return 0x00** regardless of mode (0-3), speed (100KHz-10MHz), or read method
+- **Conclusion**: GPIO 154-157 are likely NOT physically connected to the touch IC
 
-The touch IC uses an AHB bus bridge for register access:
+### SPI4 (GPIO 171-174) — N/A
+- GPIO 171-172 = I2C SDA/SCL (connected, confirmed working)
+- GPIO 173-174 = would be SPI CLK/CS, but spi-gpio test showed MISO stuck HIGH
+- GENI SE4 proto=3 (I2C), cannot be changed at runtime (no qupv3fw.elf on sc8280xp)
+- **Conclusion**: SE4 only has I2C lines connected, SPI lines (CLK/CS) not routed
 
-| Command | Address | Purpose |
-|---------|---------|---------|
-| cmd 0x00 | -- | Set target AHB address (4 bytes) |
-| cmd 0x08 | -- | Read AHB data |
-| cmd 0x0C | -- | Set AHB direction (0x00=read) |
-| cmd 0x0D | -- | Burst mode (0x12=off, 0x13=on) |
-| cmd 0x13 | -- | Continuous mode (0x31=enable) |
-| cmd 0x31 | -- | Safe mode ({0x27,0x95}=enter, {0x00,0x00}=exit) |
+## Previous Incorrect Assumptions (Corrected)
 
-### Key Register Map
+1. ~~"SPI, not I2C"~~ → **I2C works for reads, SPI doesn't work at all**
+2. ~~"i2cdetect shows no devices"~~ → **i2cdetect works after toggling reset GPIO**
+3. ~~"GENI SE supports both I2C and SPI"~~ → **SE4 is locked to I2C by bootloader**
+4. ~~"EGoTouchRev SPI protocol"~~ → **That's Windows SPBTESTTOOL framework framing, not raw SPI**
 
-| Register | Address | Purpose |
-|----------|---------|---------|
-| System Reset | 0x90000018 | Write 0x55 for SW reset |
-| FW ISR Control | 0x9000005C | Write 0xA5 for FW stop |
-| Status Check | 0x900000A8 | Read: 0x05 = active |
-| Chip ID | 0x900000D0 | HX83121A identification |
-| Flash Reload | 0x100072C0 | Read: 0xC072 = reload done |
-| Raw Out Select | 0x100072EC | 0xF6=rawdata, 0x0A=idle |
-| Sorting Mode | 0x10007F04 | 0x0000=normal, 0x2222=open |
-| FW Version | 0x10007004 | Firmware version |
-| RX/TX Count | 0x100070F4 | Panel electrode count |
-| Resolution | 0x100070FC | X/Y resolution |
-| SRAM Raw Data | 0x10000000 | Raw frame data start |
+## Zero-Flash Architecture
 
-### Frame Format
+The HX83121A is a "zero-flash" TDDI IC:
+- SRAM at 0x08000000 is empty (0x78 pattern) after boot
+- `sorting_mode = 0x9999` confirms IC is in "awaiting firmware" state
+- Firmware must be downloaded from host on every boot
+- **Problem**: firmware download requires SRAM writes, which don't work over I2C
 
-- **Master frame**: 5063 bytes = 7 header + 4800 heatmap (40x60 grid, 16-bit) + 256 status table
-- **Slave frame**: 339 bytes (pen/noise data)
-- **Status table** (last 256 bytes of master frame): contains processed touch coordinates and stylus data
+### Extracted Firmware
+- **Source**: `himax_thp_drv.dll` from Windows driver package
+- **File**: `/tmp/gaokun_thp/hx83121a_gaokun_fw.bin` (261,120 bytes)
+- **Variant**: Gaokun-specific (contains "Gaok" sensor string)
+- **Structure**: Standard Himax zero-flash format with CRC sections
 
-### Init Sequence (sense_on)
+## AHB Bridge Protocol (I2C)
 
-1. Enter safe mode (`{0x27, 0x95}` to cmd 0x31)
-2. Set N frame count
-3. Disable flash reload
-4. Switch mode (0x0000=normal to 0x10007F04)
-5. Hardware/software reset
-6. Wait for flash reload (0xC072 at 0x100072C0)
-7. Set raw data type (0xF6 to 0x100072EC)
-8. Write SRAM password (0x5AA5)
-9. Exit safe mode
+The bus command protocol is identical to EGoTouchRev's SPI protocol but over I2C:
 
-## DTS Changes Needed
+```
+Bus Commands (first byte of I2C write):
+  0x00 [addr3 addr2 addr1 addr0]  - Set AHB target address (LITTLE ENDIAN!)
+  0x08 [data...]                   - Read/write data
+  0x0C [dir]                       - Direction: 0x00=read, 0x01=write (writes don't work)
+  0x0D [val]                       - INCR4: 0x10=enable
+  0x11 [val]                       - AHB enable: 0x01
+  0x13 [val]                       - CONTI: 0x31=enable
+  0x30                             - Read event data (56 bytes)
+  0x31 [val]                       - Safe mode / password
 
-To enable SPI touchscreen, the DTS would need:
+Read sequence:
+  burst_enable() → bus_write(0x00, LE_addr) → bus_write(0x0C, 0x00) → bus_read(0x08, N)
+
+Write sequence (DOES NOT WORK on this IC):
+  burst_enable() → bus_write(0x00, LE_addr) → bus_write(0x0C, 0x01) → bus_write(0x08, data)
+```
+
+## Key Register Map
+
+| Register | Address | Read Value | Purpose |
+|----------|---------|------------|---------|
+| IC ID | 0x900000D0 | 0x83121A00 | Chip identification |
+| Chip Status | 0x900000A8 | 0x05 | 0x05=ACTIVE |
+| Handshake | 0x900000AC | 0xF8 | Boot handshake |
+| System Reset | 0x90000018 | - | Write 0x55 for reset (if writes worked) |
+| FW ISR Control | 0x9000005C | - | Write 0xA5 for FW stop |
+| FW Version | 0x10007004 | 0x4103C20F | Firmware version |
+| HW ID | 0x10007010 | 0x04390208 | Hardware ID |
+| Sensor Name | 0x10007014 | "Gaok" | Sensor variant |
+| Sorting Mode | 0x10007F04 | 0x9999 | 0x9999=awaiting FW |
+| Flash Reload | 0x100072C0 | varies | Reload status |
+| SRAM Base | 0x08000000 | 0x78787878 | Firmware target (empty) |
+
+## Possible Next Approaches
+
+### Approach 1: I2C HID Protocol
+The HX83121A might support I2C HID natively when firmware IS loaded (by UEFI).
+- UEFI loads touch firmware during boot → touch works in UEFI
+- If Linux panel driver skips re-init (skip_init=1), UEFI FW stays active
+- Try reading I2C HID descriptor from register 0x0001
+- Script: `/tmp/touch_i2c_hid_test.py` (not yet run)
+
+### Approach 2: Preserve UEFI Touchscreen State
+- Boot with panel driver `skip_init=1` to avoid re-initializing the TDDI
+- UEFI already downloads firmware and enables touch
+- The I2C HID interface might already be active
+- Risk: display timing might not match Linux expectations
+
+### Approach 3: DSI Command-Based Firmware Download
+- The panel driver already sends DSI commands successfully to both links
+- The HX83121A might accept firmware data via DSI generic/DCS commands
+- This bypasses the I2C AHB write limitation entirely
+- Needs research into Himax DSI firmware download protocol
+
+### Approach 4: Investigate Windows Driver More Deeply
+- Check if Windows himax_thp_drv.dll uses a different I2C write mechanism
+- Check if there's an I2C "unlock" sequence before writes
+- Check if Windows uses DMA or a different bus master for SRAM writes
+
+### Approach 5: Contact linux-gaokun Maintainers
+- The gaokun3 DTS already has touch IC entries, implying someone has worked on this
+- Ask about their touchscreen experience and any unlisted patches
+
+## TDDI Coupling Warning
+
+**CRITICAL**: The HX83121A is a TDDI (Touch & Display Driver Integration) IC. Resetting the touch controller via GPIO 99 also resets the display controller, causing:
+- DSI link errors (byte_clk stuck)
+- Display goes black
+- Requires full system reboot to recover
+
+Never reset GPIO 99 while the display is active!
+
+## Display Blanking Issue
+
+GNOME/GDM has a 5-minute screen timeout that triggers DPMS Off, which crashes the DSI clocks:
+- `consoleblank=0` kernel parameter only affects fbcon, not enough
+- Must disable GDM (`systemctl disable gdm`) during touchscreen debugging
+- Or use `xset s off -dpms` / `gsettings set org.gnome.desktop.session idle-delay 0`
+- Service `/etc/systemd/system/disable-blanking.service` prevents console blanking
+
+## DTS Changes Made (2026-02-09)
 
 ```dts
-/* Disable I2C mode */
-&i2c4 {
-    status = "disabled";
+/* 1. Removed GPIO 154-157 from reserved ranges */
+gpio-reserved-ranges = <70 2>, <74 6>, <83 4>, <125 2>, <128 2>;
+/* was: ... <128 2>, <154 4>; */
+
+/* 2. Added spi6 pinctrl */
+spi6_default: spi6-default-state {
+    spi-pins {
+        pins = "gpio154", "gpio155", "gpio156";
+        function = "qup6";
+        drive-strength = <6>;
+        bias-disable;
+    };
+    cs-pins {
+        pins = "gpio157";
+        function = "qup6";
+        drive-strength = <6>;
+        bias-disable;
+        output-high;
+    };
 };
 
-/* Enable SPI mode on the same GENI SE */
-&spi4 {
-    status = "okay";
-    pinctrl-0 = <&ts0_default>;
+/* 3. Enabled spi6 with spidev */
+&spi6 {
+    pinctrl-0 = <&spi6_default>;
     pinctrl-names = "default";
-
-    touchscreen@0 {
-        compatible = "himax,hx83121a-ts";  /* needs new driver */
+    status = "okay";
+    spidev@0 {
+        compatible = "rohm,dh2228fv";
         reg = <0>;
-        spi-max-frequency = <10000000>;     /* TBD - check Windows SPI clock */
-        interrupts-extended = <&tlmm 175 IRQ_TYPE_LEVEL_LOW>;
-        reset-gpios = <&tlmm 99 GPIO_ACTIVE_LOW>;
-        vdd-supply = <&vreg_misc_3p3>;
-        vddl-supply = <&vreg_s10b>;
+        spi-max-frequency = <10000000>;
     };
 };
 ```
 
-## Linux Driver Options
-
-### Option 1: Adapt existing `himax_hx83112b.c`
-
-The kernel has `drivers/input/touchscreen/himax_hx83112b.c` for a related Himax IC. However:
-- It only supports I2C transport
-- The HX83121A uses a different register set (on-cell vs in-cell)
-- Would need significant modifications for SPI + dual Master/Slave
-
-### Option 2: Port EGoTouchRev to Linux kernel module
-
-The EGoTouchRev project has detailed SPI protocol, register maps, and init sequences. Key gaps:
-- **Coordinate extraction** -- currently reads raw heatmap, not processed coordinates
-- **Normal mode** -- hasn't found the register sequence for DSP-processed coordinates
-- **VHF/input reporting** -- no code for injecting touch events
-
-### Option 3: Write a new SPI HID driver
-
-If the touch IC supports HID-over-SPI (Microsoft's HIDSPI protocol), a `hid-over-spi` style driver could work. However:
-- The IC likely uses a proprietary protocol, not standard HIDSPI
-- The EGoTouchRev reverse engineering suggests a custom Himax protocol
-
-### Option 4: Userspace driver via spidev
-
-Quick prototyping path:
-1. Enable `spi@990000` with a `spidev` compatible node
-2. Use `spidev` from userspace to send the SPI commands from EGoTouchRev
-3. Once communication is verified, develop a proper kernel driver
-
-## Recommended Next Steps
-
-1. **Switch GENI SE to SPI mode** in DTS and verify basic SPI communication using `spidev`
-2. **Port the EGoTouchRev init sequence** to a Linux test script
-3. **Read the touch IC chip ID** (0x900000D0) to confirm communication
-4. **Investigate the status table** (last 256 bytes of master frame) -- it may contain processed coordinates
-5. **Check if the IC supports I2C at all** -- some HX83121A variants might have I2C disabled in firmware
+**Result**: SPI6 probed but returns all zeros. These changes may need to be reverted.
 
 ## References
 
-- [EGoTouchRev-rebuild](https://github.com/awarson2233/EGoTouchRev-rebuild) -- Windows userspace driver with reverse-engineered SPI protocol
-- `drivers/input/touchscreen/himax_hx83112b.c` -- Kernel Himax I2C driver (related IC)
-- `drivers/hid/hid-goodix-spi.c` -- Example SPI touchscreen HID driver
-- Himax HX83121A -- Display + touch integrated controller IC
+- [EGoTouchRev-rebuild](https://github.com/awarson2233/EGoTouchRev-rebuild) — Windows userspace driver with reverse-engineered SPI protocol
+- `drivers/input/touchscreen/himax_hx83112b.c` — Kernel Himax I2C driver (related IC)
+- `drivers/input/touchscreen/himax_hx852x.c` — Simpler Himax I2C driver
+- `drivers/hid/hid-goodix-spi.c` — Example SPI touchscreen HID driver
+- Himax HX83121A — Display + touch integrated controller IC (TDDI)

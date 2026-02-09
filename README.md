@@ -15,7 +15,7 @@ Native GPU-accelerated display driver for the Huawei MateBook E Go, the first wo
 ## What's included
 
 - **Panel driver** (`panel-driver/`) -- standalone kernel module for the HX83121A panel with DTB overlay loader
-- **Kernel patches** (`kernel-patches/`) -- 5 patches against Linux 6.18.8 fixing clock, DPU, bridge, and Bluetooth bugs
+- **Kernel patches** (`kernel-patches/`) -- 6 patches against Linux 6.18.8 fixing clock, DPU, bridge, Bluetooth, and EC suspend bugs
 - **Device tree** (`device-tree/`) -- DTS source and pre-built DTB for the MateBook E Go
 - **Boot configs** (`boot/`) -- reference GRUB and mkinitcpio configurations
 - **Touchpad activation** (`tools/touchpad/`) -- systemd service + script for keyboard cover touchpad
@@ -24,7 +24,7 @@ Native GPU-accelerated display driver for the Huawei MateBook E Go, the first wo
 
 ## Bug fixes
 
-Getting this panel working required fixing 6 bugs across 5 kernel subsystems. The 4 kernel patches address issues that affect any sc8280xp DSC dual-DSI display; the remaining 2 fixes are in the panel driver itself.
+Getting this panel working required fixing 6 bugs across 5 kernel subsystems. The 4 kernel patches address issues that affect any sc8280xp DSC dual-DSI display; the remaining 2 fixes are in the panel driver itself. An additional patch fixes EC suspend/resume.
 
 1. **aux-bridge: handle missing endpoint** -- USB-C PHYs with DP alt-mode but no display output cause probe failure; return 0 on `-ENODEV` instead.
 
@@ -80,7 +80,7 @@ cp device-tree/sc8280xp-huawei-gaokun3.dtb /boot/
 Key GRUB parameters (see `boot/grub.cfg` for full reference):
 
 ```
-clk_ignore_unused pd_ignore_unused arm64.nopauth fbcon=rotate:1 usbhid.quirks=0x12d1:0x10b8:0x20000000
+clk_ignore_unused pd_ignore_unused arm64.nopauth fbcon=rotate:1 usbhid.quirks=0x12d1:0x10b8:0x20000000 consoleblank=0
 devicetree /boot/sc8280xp-huawei-gaokun3.dtb
 ```
 
@@ -167,7 +167,7 @@ ath11k_pci
 - Keyboard cover: working (keyboard + touchpad with usbhid quirk + activation service)
 - Bluetooth: working (WCN6855 / btqca, with NVM patch + kernel patch)
 - WiFi: working (WCN6855 / ath11k_pci)
-- Touchscreen: not working (needs SPI driver, see [docs/TOUCHSCREEN.md](docs/TOUCHSCREEN.md))
+- Touchscreen: not working (I2C read-only; firmware download blocked, see [docs/TOUCHSCREEN.md](docs/TOUCHSCREEN.md))
 - GPU acceleration (Adreno): untested beyond basic modesetting
 
 ## Acknowledgements

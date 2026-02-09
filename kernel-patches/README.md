@@ -1,6 +1,6 @@
 # Kernel Patches
 
-Five patches against Linux 6.18.8 for the Huawei MateBook E Go on Snapdragon 8cx Gen 3 (sc8280xp). Patches 1-4 are required for the dual-DSI DSC display (HX83121A panel); patch 5 fixes Bluetooth. Patches 2-4 likely affect any sc8280xp DSC display.
+Six patches against Linux 6.18.8 for the Huawei MateBook E Go on Snapdragon 8cx Gen 3 (sc8280xp). Patches 1-4 are required for the dual-DSI DSC display (HX83121A panel); patch 5 fixes Bluetooth; patch 6 fixes EC suspend/resume. Patches 2-4 likely affect any sc8280xp DSC display.
 
 ## Applying
 
@@ -121,3 +121,22 @@ The original check assumes that any NVM address is a factory placeholder that ne
 ```
 
 **Impact:** Any QCA Bluetooth controller where the NVM firmware has been patched with a valid BD address but no `local-bd-address` device tree property is present. Must be used together with the NVM firmware patch (`tools/bluetooth/patch-nvm-bdaddr.py`).
+
+---
+
+## 0006 -- platform/arm64: huawei-gaokun-ec: fix suspend/resume ordering
+
+**File:** `drivers/platform/arm64/huawei-gaokun-ec.c`
+
+**Problem:** System suspend/resume fails silently. The EC suspend handshake never completes because the I2C bus is already suspended when the EC driver tries to communicate.
+
+**Root cause:** The driver uses `NOIRQ_SYSTEM_SLEEP_PM_OPS`, which runs the suspend/resume callbacks in the noirq phase -- after IRQs are disabled and I2C bus controllers have been suspended. At this point, the I2C transactions to the EC fail.
+
+**Fix:** Switch to `SYSTEM_SLEEP_PM_OPS`, which runs during the normal suspend phase while the I2C bus is still operational:
+
+```c
+- NOIRQ_SYSTEM_SLEEP_PM_OPS(gaokun_ec_suspend, gaokun_ec_resume)
++ SYSTEM_SLEEP_PM_OPS(gaokun_ec_suspend, gaokun_ec_resume)
+```
+
+**Impact:** Huawei MateBook E Go (GK-W7X) suspend/resume via the gaokun-ec embedded controller driver.
