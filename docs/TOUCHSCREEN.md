@@ -1,8 +1,12 @@
 # Touchscreen Research Notes
 
-## Status: Not Working — Code SRAM hardware write-protected, Boot ROM not auto-loading
+## Status: Not Working — Boot ROM requires UEFI/XBL trigger (all software methods exhausted)
 
-The MateBook E Go's touchscreen uses the **Himax HX83121A** TDDI (Touch & Display Driver Integration) IC. We have established communication via both **I2C** (AHB bridge at 0x48) and **SPI** (Mode 3, Himax protocol via spidev0.0 on SPI6). Firmware has been successfully programmed to on-chip flash via the SPI200 controller and verified 100%. However, **code SRAM (0x08000000) is hardware write-protected** from both I2C and SPI, and the **boot ROM does not auto-load firmware from flash** after GPIO reset. The IC stays at status=0x04 (idle) instead of 0x05 (FW running).
+The MateBook E Go's touchscreen uses the **Himax HX83121A** TDDI (Touch & Display Driver Integration) IC with a **THP (Touchscreen Host Processing) architecture** — the IC outputs raw capacitive data and host-side software computes touch coordinates. On Windows, this requires the `HuaweiThpService` daemon; stopping it disables touch entirely.
+
+We have established communication via both **I2C** (AHB bridge at 0x48) and **SPI** (Mode 3, Himax protocol via spidev0.0 on SPI6). Firmware has been successfully programmed to on-chip flash via the SPI200 controller and **verified 100% byte-by-byte**. Flash is **unprotected** (SR1/2/3=0x00, Puya P25Q40H chip). CRC is correct. However, the **boot ROM refuses to load firmware** regardless of the method used — GPIO hardware reset, software system reset, full EGoTouchRev sequence reproduction, or reload engine manipulation. The IC stays at status=0x04 (idle) instead of 0x05 (FW running).
+
+On a confirmed working system (Detach0-0), IC status is already 0x05 **before any driver runs**, indicating UEFI/XBL triggers Boot ROM during the display initialization phase. Our UEFI/XBL does not appear to do this.
 
 ## Hardware
 
@@ -13,7 +17,8 @@ The MateBook E Go's touchscreen uses the **Himax HX83121A** TDDI (Touch & Displa
 | SPI Bus | SPI6 via spidev0.0, Mode 3 (CPOL=1, CPHA=1), 1MHz |
 | I2C Bus | GENI SE4 at 0x990000 (proto=3=I2C) |
 | I2C Addresses | 0x48 (AHB bridge), 0x4F (HID event interface) |
-| Architecture | Master/Slave dual-IC, zero-flash |
+| Architecture | THP (Touchscreen Host Processing), Master/Slave dual-SPI |
+| On-chip Flash | Puya P25Q40H, 4Mbit/512KB SPI NOR (JEDEC 0x856013) |
 | Touch matrix | 36 RX × 18 TX electrodes |
 | Max touch points | 10 |
 | Interrupt GPIO | tlmm 175 (active low) |
@@ -143,35 +148,69 @@ Every attempt to write to 0x08000xxx returns 0x78787878 (empty pattern):
 
 **Conclusion**: Code SRAM has **hardware write protection** that cannot be disabled from the SPI/I2C bus. Only the IC's internal hardware (boot ROM / reload engine) can write to it.
 
-## Boot ROM — Not Auto-Loading
+## Boot ROM — ALL Methods Exhausted, NOT Loading
 
-After GPIO reset with correct register setup:
-- **Status (0x900000A8)**: 0x04 (idle) — never reaches 0x05 (FW running)
-- **reload_done (0x100072C0)**: 0x00000000 — never becomes 0x72C0
-- **Code SRAM**: 0x78787878 at all addresses
+### Verified OK
+- Flash content 100% matches DLL-extracted firmware (byte-by-byte comparison via I2C AHB bridge)
+- Flash not protected (SPI Status Register 1/2/3 = 0x00)
+- Flash CRC correct (0x7D4E5A69 at 0x3FBFC → HW CRC = 0)
+- Flash header "HX83121-A" present at flash address 0x00000
+- GPIO99 reset works correctly (IC resets, I2C communication recovers)
+- IC responds with correct ID (0x83121A00) after every reset
+
+### After Every Reset Attempt
+- **Status (0x900000A8)**: 0x04 (idle) — **never** reaches 0x05 (FW running)
+- **reload_done (0x100072C0)**: 0x00000000 — **never** becomes 0x72C0
+- **Code SRAM**: 0x78787878 at all addresses — **never** populated
 - **reload_status (0x80050000)**: 0x00000012 (initial)
+- **Boot stat (0x900000E0)**: 0x54930000 (unchanged across all tests)
 - **Flash data**: Intact and correct
 
-### Full EGoTouchRev Boot Sequence Attempted
-Following the exact sequence from [Detach0-0's Windows driver](https://github.com/awarson2233/EGoTouchRev-rebuild):
+### All Failed Boot Attempts
 
-1. Clear 0x100072C0 (reload_done flag)
-2. GPIO 99 reset (LOW 20ms, then HIGH)
-3. burst_enable(1)
-4. init_buffers_and_register (clear 0x10007550)
-5. Enter safe mode
-6. Write 0x00000000 to 0x10007F00 (flash reload enable)
-7. Write 0x00000000 to 0x10007F04 (sorting mode)
-8. 5× retry: clear 0x100072C0, GPIO reset, burst_enable, check status==0x05
-9. Fallback: system reset (0x90000018=0x55)
+| # | Method | Tool | Result |
+|---|--------|------|--------|
+| 1 | GPIO99 hardware reset (20ms LOW) | C tool via gpiochip4 | 0x04 |
+| 2 | System reset (0x90000018=0x55) | I2C AHB write | 0x04 |
+| 3 | 5× GPIO reset (EGoTouchRev hx_sense_on sequence) | GPIO + I2C | 0x04 |
+| 4 | Safe mode + data SRAM config + GPIO reset | I2C + GPIO | 0x04 |
+| 5 | Reload engine activ_relod (0xEC to 0x90000048) | I2C | reload_status changes, no SRAM copy |
+| 6 | Oscillator enable (0x900880A8/E0) before reset | I2C | 0x04 |
+| 7 | Flash auto mode (0x80000004) | I2C | 0x04 |
+| 8 | Long reset pulse (500ms) | GPIO | 0x04 |
+| 9 | Config partitions written from FW binary | I2C | 0x04 |
+| 10 | Full EGoTouchRev init_buffers + hx_sense_on(true) | GPIO + I2C | 0x04 |
 
-**Result**: Status stays at 0x04 through all 5 attempts. Boot ROM does not load firmware.
+### Full EGoTouchRev Sequence Reproduction (Test #10 detail)
+Following the **exact** sequence from [Detach0-0's Windows driver](https://github.com/awarson2233/EGoTouchRev-rebuild):
+
+1. GPIO99 reset (bus_fail handler: hw_reset slave+master)
+2. check_bus + burst_enable
+3. init_buffers_and_register (clear 0x10007550 80B + 0x1000753C 4B)
+4. Enter safe mode (0x31=0x27, 0x32=0x95)
+5. hx_set_N_frame(1) — write 0x01 then 0x7F0C0001 to 0x10007294
+6. hx_reload_set(0) — write 0x00000000 to 0x10007F00 (enable flash reload)
+7. hx_switch_mode(RAWDATA) — write 0x00000000 to 0x10007F04
+8. 5× retry: clear 0x100072C0, GPIO99 reset, burst_enable, poll status
+9. Fallback: software system reset (0x90000018=0x55)
+
+**Result**: Status stays at 0x04 through all 5 HW reset attempts + SW reset. Boot ROM does not load firmware.
+
+### Flash Protection Check
+Via SPI200 RDSR/JEDEC commands through I2C AHB bridge:
+- Flash SR1 = 0x00 (no block protect, no write enable latch)
+- Flash SR2 = 0x00 (no quad enable, no security bits)
+- Flash SR3 = 0x00 (no write protect)
+- JEDEC ID = 0x856013 (Puya P25Q40H, 4Mbit/512KB)
 
 ### Reload Engine Investigation
-- Writing 0xEC to activ_relod (0x90000048) changes reload_status from 0x12 to 0x01000000
+- Writing 0xEC to activ_relod (0x90000048) changes reload_status from 0x12 to 0x10
 - But NO data is copied to code SRAM
 - CRC registers (0x80050018) stay at 0xFFFFFFFF
 - Pre-configuring reload_addr_from/cmd_beat has no effect
+
+### Conclusion
+The Boot ROM requires an **external trigger from UEFI/XBL** during the display initialization phase. On Detach0-0's working system, IC status is already 0x05 before any Windows driver runs. This trigger cannot be replicated from Linux userspace via I2C, SPI, or GPIO.
 
 ## Firmware Analysis
 
@@ -226,8 +265,15 @@ Format: 16-byte entries: `[sram_addr(4)][size(4)][fw_offset(4)][flags(4)]`
 - **Uses SPI** via SPBTESTTOOL.sys driver (IOCTLs for SPI full-duplex + GPIO control)
 - **Dual device**: master (THPA/SPI6) + slave (THPB/SPI20)
 
-### Hypothesis
-On Detach0-0's Windows system, the **proprietary Himax driver** (from `himax_thp_drv.dll`) loads firmware to code SRAM via SPI using an unknown protocol. After that, GPIO reset preserves SRAM contents, and boot ROM re-validates/restarts FW. EGoTouchRev only does the reset+check, not the initial FW load.
+### Root Cause Hypothesis
+The Boot ROM requires a trigger from UEFI/XBL that occurs during the display initialization phase — possibly a specific DSI command, power sequencing event, or flash controller initialization that we cannot replicate from Linux userspace.
+
+**Ruled out**: Flash content mismatch, flash protection, flash CRC, GPIO reset timing, data SRAM configuration, reload engine, software reset, 6.18 MSM DRM disruption (same result on 6.14 simpledrm).
+
+**Remaining possibilities**:
+1. UEFI/XBL sends a specific command during DSI panel init that triggers Boot ROM
+2. Factory flash contains additional data (header/config) not present in the DLL-extracted firmware
+3. IC OTP is configured for "host-triggered boot" rather than "auto-load on power-on"
 
 ## TDDI Coupling Warning
 
@@ -238,32 +284,52 @@ On Detach0-0's Windows system, the **proprietary Himax driver** (from `himax_thp
 
 Never reset GPIO 99 while the display is active!
 
-## Possible Next Approaches
+## Next Steps (Priority Order)
 
-### Approach A: Ask Detach0-0
-Key questions:
-1. Is IC status already 0x05 when EGoTouchRev starts?
-2. Does the Windows proprietary driver load FW first?
-3. After cold reboot, does your driver work without Windows loading FW?
-4. Is code SRAM populated before your first GPIO reset?
+### 1. Windows Warm Reboot Test (Highest Priority)
+Install Windows via UUP dump → boot → verify touch works (status=0x05) → warm reboot to Linux → immediately check IC status via I2C.
+- If status=0x05 persists: UEFI/XBL Boot ROM trigger carries over through warm reboot
+- Compare flash content and IC registers between Windows-booted and Linux-booted states
+- Test reading touch event data via bus cmd 0x30
 
-### Approach B: Cold Power Cycle Test
-Full shutdown → power on → immediately check flash persistence and boot ROM behavior.
-Boot ROM may only trigger on Power-On Reset (POR), not on GPIO reset.
+### 2. Get Detach0-0's Flash Dump
+Ask Detach0-0 to dump their flash content (especially 0x20000-0x2002F header area and 0x40000+ region) for byte-by-byte comparison with our DLL-extracted firmware.
 
-### Approach C: Windows Warm Reboot
-Boot Windows (FW loaded to SRAM) → warm reboot to Linux without resetting GPIO 99 → SRAM may retain firmware.
+### 3. Investigate UEFI Touch Init Module
+Huawei's UEFI firmware likely contains a touch initialization module that triggers Boot ROM. Reverse-engineering this could reveal the exact trigger mechanism.
 
-### Approach D: Reverse Windows DLL
-The `himax_thp_drv.dll` contains firmware download code. It may use a special SPI command that bypasses the AHB bridge to write directly to code SRAM.
+### 4. Write Linux THP Driver (after Boot ROM is solved)
+Once firmware loads successfully (status=0x05):
+- **Option A**: Linux THP driver — read raw touch data via SPI bus cmd 0x30, compute coordinates on host, output via uinput
+- **Option B**: Switch IC to I2C HID mode (HIMX1234 at 0x4F) → use standard hid-multitouch kernel driver
+- Windows `HuaweiThpService` reads 5063 bytes (master) + 339 bytes (slave) per frame via SPI
 
-### Approach E: UEFI Application
-Write a custom UEFI app that loads touch firmware before Linux boots, using raw MMIO SPI access.
+### 5. UEFI Application (Fallback)
+Write a custom UEFI app or DXE driver that runs before Linux boot and triggers the Boot ROM using the same mechanism as the OEM UEFI.
 
-### Approach F: Community / Upstream
-- [linux-gaokun](https://github.com/right-0903/linux-gaokun) project tracks MateBook E Go Linux support
-- [awarson2233/EGoTouchRev-rebuild](https://github.com/awarson2233/EGoTouchRev-rebuild) — reference Windows driver
-- Wait for community progress or contribute findings
+### 6. Community / Upstream
+- [linux-gaokun](https://github.com/right-0903/linux-gaokun) — MateBook E Go Linux support project
+- [awarson2233/EGoTouchRev-rebuild](https://github.com/awarson2233/EGoTouchRev-rebuild) — Windows ARM64 userspace touch driver
+- Contribute findings to help the community
+
+## THP (Touchscreen Host Processing) Architecture
+
+Unlike traditional touchscreens where the IC computes coordinates internally, the HX83121A uses **THP** — the IC only outputs raw capacitive sensing data, and host-side software computes touch coordinates, gestures, and palm rejection.
+
+### Windows Architecture
+1. **THPVHF Device** — virtual HID framework kernel driver (must be manually added in Device Manager)
+2. **HuaweiThpService** — userspace daemon that:
+   - Reads raw touch data from IC via SPI (bus cmd 0x30, 5063 bytes master + 339 bytes slave per frame)
+   - Processes data using `himax_thp_drv.dll` (coordinate calculation, gesture recognition)
+   - Outputs HID reports via THPVHF
+3. **Stopping HuaweiThpService = touch stops working** (confirmed by forum users)
+
+### Linux Implications
+- Standard `hid-multitouch` won't work directly (IC doesn't output HID reports in THP mode)
+- Need either:
+  - Custom Linux THP driver (SPI → raw data → coordinate computation → uinput/evdev)
+  - Switch IC to I2C HID mode (HIMX1234/PNP0C50 at 0x4F) if supported by firmware
+- The DLL's coordinate algorithm may need reverse-engineering for proper Linux implementation
 
 ## References
 
