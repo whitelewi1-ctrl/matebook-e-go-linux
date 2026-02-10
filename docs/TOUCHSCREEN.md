@@ -216,9 +216,23 @@ The Boot ROM requires an **external trigger from UEFI/XBL** during the display i
 
 ### Firmware Binary
 - **File**: `hx83121a_gaokun_fw.bin` (261,120 bytes / 0x3FC00)
-- **Source**: Extracted from Windows `himax_thp_drv.dll` driver
-- **Header**: "HX83121-A", date 2022-09-27
-- **Variant**: Gaokun-specific (contains "Gaok" sensor string)
+- **Source**: Extracted from Windows `himax_thp_drv.dll` driver (Copy4 variant)
+- **Header**: "HX83121-A", date 2022-09-27 19:30:56
+- **Variant**: CSOT panel (confirmed by flash byte-by-byte match)
+
+### Panel Variants (from himax_thp_drv.dll in Gaokun_THP_Software_1.0.1.39.exe)
+
+The DLL embeds **3 full firmware copies** for different panel types, selected by OTP project ID:
+
+| DLL Offset | Date | MD5 | Panel Type |
+|-----------|------|-----|------------|
+| 0x0681c0 | 19:32:44 | 4454a1c2... | BOE (estimated) |
+| 0x0a7dc0 | 19:34:25 | aaf608db... | CSOT New (estimated) |
+| 0x0e79c0 | 19:30:56 | e538f2f6... | **CSOT — our device** |
+
+4 panel types referenced in DLL strings: "Found CSOT panel!", "Found CSOT New panel!", "Found BOE new panel!", "Found BOE old panel!". Selection is done by `hx_firmware_remapping()` based on `getProjectID_OTP()` + CG Color + Sensor ID.
+
+**Our device's flash matches Copy4 (CSOT) exactly** — firmware variant mismatch has been ruled out as the Boot ROM failure cause.
 
 ### Partition Table (flash offset 0x20030)
 
@@ -268,7 +282,7 @@ Format: 16-byte entries: `[sram_addr(4)][size(4)][fw_offset(4)][flags(4)]`
 ### Root Cause Hypothesis
 The Boot ROM requires a trigger from UEFI/XBL that occurs during the display initialization phase — possibly a specific DSI command, power sequencing event, or flash controller initialization that we cannot replicate from Linux userspace.
 
-**Ruled out**: Flash content mismatch, flash protection, flash CRC, GPIO reset timing, data SRAM configuration, reload engine, software reset, 6.18 MSM DRM disruption (same result on 6.14 simpledrm).
+**Ruled out**: Flash content mismatch, flash protection, flash CRC, GPIO reset timing, data SRAM configuration, reload engine, software reset, 6.18 MSM DRM disruption (same result on 6.14 simpledrm), **firmware variant mismatch** (flash confirmed as correct CSOT variant).
 
 **Remaining possibilities**:
 1. UEFI/XBL sends a specific command during DSI panel init that triggers Boot ROM
@@ -316,13 +330,29 @@ Write a custom UEFI app or DXE driver that runs before Linux boot and triggers t
 
 Unlike traditional touchscreens where the IC computes coordinates internally, the HX83121A uses **THP** — the IC only outputs raw capacitive sensing data, and host-side software computes touch coordinates, gestures, and palm rejection.
 
-### Windows Architecture
-1. **THPVHF Device** — virtual HID framework kernel driver (must be manually added in Device Manager)
-2. **HuaweiThpService** — userspace daemon that:
-   - Reads raw touch data from IC via SPI (bus cmd 0x30, 5063 bytes master + 339 bytes slave per frame)
-   - Processes data using `himax_thp_drv.dll` (coordinate calculation, gesture recognition)
-   - Outputs HID reports via THPVHF
-3. **Stopping HuaweiThpService = touch stops working** (confirmed by forum users)
+### Windows THP Software Stack (Gaokun_THP_Software_1.0.1.39.exe)
+
+```
+SpbThpTool.sys (ARM64 KMDF)     ← SPI kernel driver, ACPI\HIMX0001/HIMX0002
+  └── IOCTL interface
+SpiModule.x64.dll                ← Userspace SPI layer (DeviceIoControl)
+himax_thp_drv.dll (1.5MB)       ← Himax IC core driver
+  ├── 3 embedded FW variants (CSOT, CSOT New, BOE)
+  ├── hx_firmware_remapping()    ← OTP project ID → FW selection
+  ├── flashProgramming()         ← Flash programming via SPI200
+  └── hx_sense_on()              ← Start touch sensing
+TSACore.dll (1.7MB)              ← Touch Signal Algorithm (raw → coords)
+TSAPrmt.dll (5.0MB)              ← TSA parameters (per-panel tuning)
+ApDaemon.dll (1.5MB)             ← Main daemon orchestrator
+  ├── DriverThp                  ← Touch driver management
+  ├── ThpBase                    ← Base touch processing
+  └── VHF injection              ← HID reports to Windows
+HidInjectorThp.sys (ARM64 KMDF) ← VHF virtual HID driver
+THP_Service.dll                  ← Windows Service wrapper
+HuaweiThpService.exe (.NET)      ← Service entry point
+```
+
+**Stopping HuaweiThpService = touch stops working** (confirmed by forum users)
 
 ### Linux Implications
 - Standard `hid-multitouch` won't work directly (IC doesn't output HID reports in THP mode)
