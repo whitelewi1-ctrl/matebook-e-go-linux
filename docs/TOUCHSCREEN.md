@@ -8,6 +8,22 @@ We have established communication via both **I2C** (AHB bridge at 0x48) and **SP
 
 On a confirmed working system (Detach0-0), IC status is already 0x05 **before any driver runs**, indicating UEFI/XBL triggers Boot ROM during the display initialization phase. Our UEFI/XBL does not appear to do this.
 
+### Ruled Out Causes
+- Flash content (byte-by-byte verified against DLL firmware)
+- Flash protection (SR1/SR2/SR3 = 0x00)
+- Flash CRC (fixed, HW CRC = 0)
+- GPIO hardware reset (IC resets correctly)
+- All software trigger methods (10+ different approaches)
+- Firmware variant (CSOT panel confirmed correct)
+- ACPI _STA conditions (DT02=0, SPI mode correct)
+- Panel driver GPIO38 reset (blacklist test: IC still 0x04 without panel driver)
+
+### Key Evidence from IC Register Dump (2026-02-11)
+- **Code SRAM reads 0x78787878** — confirmed by Detach0-0 to mean "hardware inaccessible", not "empty"
+- **Data SRAM is random garbage after reboot** — Boot ROM never initializes anything (flash_reload, sorting_mode, reload_done all random)
+- **flag_reset(E4) varies between boots** — 0x00000010 vs 0x00000100, reflecting different reset types
+- **Flash 0x40004 = 0x00000100** — non-erased data beyond firmware area, not written by us (factory/UEFI?)
+
 ## Hardware
 
 | Parameter | Value |
@@ -29,13 +45,18 @@ On a confirmed working system (Detach0-0), IC status is already 0x05 **before an
 
 ### ACPI-Defined Interfaces (from Windows DSDT)
 
-The DSDT defines three mutually exclusive touch interfaces, selected by firmware at boot:
+The DSDT defines three mutually exclusive touch interfaces, selected by firmware at boot via the **DT02** register:
 
-| ACPI Device | HID | Bus | Description |
-|-------------|-----|-----|-------------|
-| THPA (HIMX0001) | SPI6 | GPIO 154-157, 12MHz | Main touch (SPI) |
-| THPB (HIMX0002) | SPI20 | GPIO 87-90, 12MHz | Stylus (SPI) |
-| HIMX (HIMX1234) | I2C4 | addr 0x4F, 1MHz | I2C HID (PNP0C50) |
+| ACPI Device | HID | Bus | _STA Condition | Description |
+|-------------|-----|-----|----------------|-------------|
+| THPA (HIMX0001) | SPI7 (0x998000) | GPIO 99/175/8, 12MHz | DT02==0 → 0x0F | Main touch (SPI) |
+| THPB (HIMX0002) | SPI20 | GPIO 39, 12MHz | DT02==0 → 0x0F | Stylus (SPI) |
+| HIMX (HIMX1234) | I2C5 | addr 0x4F, 1MHz | DT02!=0 → 0x0F | I2C HID (PNP0C50) |
+
+**DT02 register** at physical address 0x0F1AE004 (OperationRegion T174, SystemMemory):
+- Our value: **DT02 = 0x00000000** → SPI mode (THPA+THPB enabled, HIMX disabled)
+- Written by UEFI/XBL at boot time
+- Verified by custom kernel module (`read_dt02.c` using `memremap()`)
 
 **Note**: I2C HID address 0x4F is for HID event interface; 0x48 is for AHB bridge register/firmware access.
 
@@ -131,7 +152,7 @@ Firmware programmed to on-chip flash via SPI200 controller (0x80000xxx):
 
 ## Code SRAM Write — ALL Methods Failed (I2C AND SPI)
 
-Every attempt to write to 0x08000xxx returns 0x78787878 (empty pattern):
+Every attempt to write to 0x08000xxx returns 0x78787878 ("inaccessible" — confirmed by Detach0-0):
 
 | # | Method | Result |
 |---|--------|--------|
@@ -160,11 +181,14 @@ Every attempt to write to 0x08000xxx returns 0x78787878 (empty pattern):
 
 ### After Every Reset Attempt
 - **Status (0x900000A8)**: 0x04 (idle) — **never** reaches 0x05 (FW running)
-- **reload_done (0x100072C0)**: 0x00000000 — **never** becomes 0x72C0
-- **Code SRAM**: 0x78787878 at all addresses — **never** populated
+- **reload_done (0x100072C0)**: random garbage — Boot ROM never initializes Data SRAM
+- **Code SRAM**: 0x78787878 at all addresses — "inaccessible" (hardware gated, not empty)
+- **Data SRAM**: random values after reboot (flash_reload=garbage, sorting_mode=garbage)
 - **reload_status (0x80050000)**: 0x00000012 (initial)
-- **Boot stat (0x900000E0)**: 0x54930000 (unchanged across all tests)
+- **Boot stat (0x900000E0)**: 0x54930000 (sometimes read fails — intermittent)
+- **flag_reset (0x900000E4)**: varies per boot (0x00000010 or 0x00000100)
 - **Flash data**: Intact and correct
+- **Flash 0x40004**: 0x00000100 (non-erased data beyond firmware area, origin unknown)
 
 ### All Failed Boot Attempts
 
@@ -282,12 +306,33 @@ Format: 16-byte entries: `[sram_addr(4)][size(4)][fw_offset(4)][flags(4)]`
 ### Root Cause Hypothesis
 The Boot ROM requires a trigger from UEFI/XBL that occurs during the display initialization phase — possibly a specific DSI command, power sequencing event, or flash controller initialization that we cannot replicate from Linux userspace.
 
-**Ruled out**: Flash content mismatch, flash protection, flash CRC, GPIO reset timing, data SRAM configuration, reload engine, software reset, 6.18 MSM DRM disruption (same result on 6.14 simpledrm), **firmware variant mismatch** (flash confirmed as correct CSOT variant).
+**Ruled out**: Flash content mismatch, flash protection, flash CRC, GPIO reset timing, data SRAM configuration, reload engine, software reset, 6.18 MSM DRM disruption (same result on 6.14 simpledrm), firmware variant mismatch (flash confirmed as correct CSOT variant), ACPI _STA conditions (DT02=0, SPI mode confirmed), panel driver GPIO38 reset (blacklist test: IC still 0x04 without panel driver loaded).
 
 **Remaining possibilities**:
 1. UEFI/XBL sends a specific command during DSI panel init that triggers Boot ROM
-2. Factory flash contains additional data (header/config) not present in the DLL-extracted firmware
+2. Factory flash contains additional data — flash 0x40004=0x00000100 is not from our firmware write
 3. IC OTP is configured for "host-triggered boot" rather than "auto-load on power-on"
+4. Comparison with Detach0-0's IC registers may reveal the difference
+
+## ACPI DSDT Analysis (2026-02-11)
+
+DSDT successfully dumped (137,829 bytes, OEM=HUAWEI, TBL=SDM8280) via custom kernel module using `memremap()` (our kernel has CONFIG_ACPI=n).
+
+### SPI/I2C Mutual Exclusion (DT02 Register)
+The UEFI writes a mode selector at physical address 0x0F1AE004. Our device has DT02=0, selecting SPI mode.
+
+### Panel Driver Reset Exclusion Test
+**Hypothesis**: Panel driver's GPIO38 reset at probe time kills XBL-loaded firmware.
+
+**Test**: Booted with `modprobe.blacklist=panel_himax_hx83121a` — no panel driver loaded at all.
+
+**Result**: IC status = 0x04. Boot ROM does NOT load even without the panel driver. This definitively proves the issue is NOT caused by our Linux panel driver. XBL never triggers Boot ROM on our device in the first place.
+
+**Bonus finding**: I2C AHB bridge (0x48) works without DSI initialization — contrary to earlier assumption.
+
+## DPMS Power Management Warning
+
+DRM runtime power management (`/sys/class/drm/card*/device/power/control = auto`) causes DPMS Off after a few minutes of idle time. When the DSI link goes down, the TDDI IC becomes completely unreachable via I2C (0x48 returns "No such device or address"). The `keep-display-on.service` prevents this by periodically poking the console and forcing DRM power to "on".
 
 ## TDDI Coupling Warning
 
@@ -300,14 +345,19 @@ Never reset GPIO 99 while the display is active!
 
 ## Next Steps (Priority Order)
 
-### 1. Windows Warm Reboot Test (Highest Priority)
-Install Windows via UUP dump → boot → verify touch works (status=0x05) → warm reboot to Linux → immediately check IC status via I2C.
-- If status=0x05 persists: UEFI/XBL Boot ROM trigger carries over through warm reboot
-- Compare flash content and IC registers between Windows-booted and Linux-booted states
-- Test reading touch event data via bus cmd 0x30
+### 1. Compare Registers with Detach0-0's Working Device (Highest Priority)
+Need Detach0-0 to read these registers on his working system and compare:
+- `0x900000E0` (boot_stat) — ours is 0x54930000
+- `0x900000E4` (flag_reset) — ours varies (0x00000010/0x00000100)
+- `0x08000400` (code SRAM) — his should have valid code, ours is 0x78787878
+- `0x10007F00` (flash_reload) — initial value after boot?
+- `0x10007F04` (sorting_mode) — initial value after boot?
+- `0x00040004` (flash 0x40004) — ours is 0x00000100
 
-### 2. Get Detach0-0's Flash Dump
-Ask Detach0-0 to dump their flash content (especially 0x20000-0x2002F header area and 0x40000+ region) for byte-by-byte comparison with our DLL-extracted firmware.
+### 2. Windows Warm Reboot Test
+Boot Windows on external drive → verify touch works (status=0x05) → warm reboot to Linux → immediately check IC status via I2C.
+- **Challenge**: SC8280XP firmware performs double reboot on warm restart, which may reset the IC
+- If status=0x05 persists: capture full register state for comparison
 
 ### 3. Investigate UEFI Touch Init Module
 Huawei's UEFI firmware likely contains a touch initialization module that triggers Boot ROM. Reverse-engineering this could reveal the exact trigger mechanism.
