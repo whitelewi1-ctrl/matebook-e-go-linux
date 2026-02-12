@@ -1,18 +1,16 @@
 # Touchscreen Research Notes
 
-## Status: UEFI Boot Sequence Reverse-Engineered — Linux Reproduction Pending
+## Status: UEFI Sequence Reproduced but Failed — Hardware-Level Boot ROM Issue
 
 ## Latest Update (2026-02-12)
 
-**MAJOR BREAKTHROUGH**: Reverse-engineered UEFI `TouchPanelInit` DXE module. The complete UEFI touch initialization sequence is now understood:
+Reverse-engineered UEFI `TouchPanelInit` DXE module and reproduced the exact sequence from Linux. **Result: Boot ROM still does not load (status stays 0x04).** This confirms the issue is hardware-level, not a missing software trigger.
 
-1. **DisplayDxe** detects panel ("CSOT_HX83121"), initializes DSI, lights up display
-2. **TouchPanelInit** sets GPIO 174 HIGH (I2C mode) → GPIO 99 HIGH (reset release) → **Boot ROM loads firmware**
-3. **I2cTouchPanel** sets GPIO 174 LOW (switch back to SPI mode) → reads HID descriptor via I2C
-
-**Key discovery**: GPIO 174 = DT02 register! The ACPI `DT02` at `0x0F1AE004` is actually GPIO 174's TLMM IN_OUT register. UEFI uses it as a software flag to switch between I2C and SPI modes.
-
-**Next step**: Reproduce the UEFI sequence from Linux using MMIO writes to TLMM registers.
+- UEFI sequence: DisplayDxe → TouchPanelInit (GPIO 174 HIGH, GPIO 99 HIGH) → I2cTouchPanel (GPIO 174 LOW)
+- GPIO 174 = DT02 register (TLMM software flag for I2C/SPI mode selection)
+- Tested with GPIO hardware reset (kills DSI) AND software system reset (preserves DSI)
+- Neither GPIO 174 state, TLMM configuration, nor DSI clock affects Boot ROM behavior
+- **Conclusion: Hardware-level Boot ROM failure (OTP/silicon revision/board difference)**
 
 ### Companion Docs
 - `docs/TOUCHSCREEN_LIVE_TEST_2026-02-11.md` — 6 rounds of live testing
@@ -324,11 +322,24 @@ Format: 16-byte entries: `[sram_addr(4)][size(4)][fw_offset(4)][flags(4)]`
 
 ### Root Cause Hypothesis (Updated 2026-02-12)
 
-**UEFI reverse engineering reveals the trigger mechanism**: The UEFI `TouchPanelInit` DXE module configures GPIO 99 with specific TLMM settings (func=11, pull-up) and releases the reset while GPIO 174 is HIGH (I2C mode). Our previous Linux reset attempts used simple GPIO toggle (func=0, no pull) — the wrong TLMM configuration may prevent Boot ROM from triggering.
+**All software trigger methods exhausted.** The UEFI TouchPanelInit sequence was fully reverse-engineered and reproduced from Linux — Boot ROM still doesn't load. This confirms the issue is **hardware-level**, not a missing software trigger.
 
-**Ruled out**: Flash content mismatch, flash protection, flash CRC, simple GPIO reset timing, data SRAM configuration, reload engine, software reset, 6.18 MSM DRM disruption (same result on 6.14 simpledrm), firmware variant mismatch (flash confirmed as correct CSOT variant), ACPI _STA conditions (DT02=0, SPI mode confirmed), panel driver GPIO38 reset (blacklist test: IC still 0x04 without panel driver loaded).
+**Completely ruled out** (12 tests in v1+v2 scripts, plus 10+ previous attempts):
+- Flash content, protection, CRC
+- GPIO 99 reset (hardware and software, with all TLMM configurations)
+- GPIO 174 I2C/SPI mode flag
+- TLMM function select, pull, drive strength
+- DSI clock dependency
+- Reload engine, activ_relod
+- Safe mode, FW stop, system reset
+- Panel driver GPIO38 interference
+- ACPI _STA conditions
+- Firmware variant mismatch
 
-**Current hypothesis**: Boot ROM requires the exact TLMM configuration used by UEFI (GPIO 99 func=11, GPIO 174 HIGH for I2C mode) to trigger firmware loading. Simple GPIO toggle with default function select is insufficient.
+**Current hypothesis**: Hardware difference between our IC and Detach0-0's working device:
+1. **OTP configuration** — IC's One-Time Programmable fuses may disable auto-boot or require different trigger
+2. **Silicon revision** — Different Boot ROM mask ROM version
+3. **Board-level difference** — Missing pull-up, disconnected signal, or power supply issue
 
 ## ACPI DSDT Analysis (2026-02-11)
 
@@ -445,16 +456,33 @@ The UEFI sequence reveals that:
 3. After Boot ROM loads, GPIO 174 is set LOW to switch back to SPI mode
 4. Our previous GPIO 99 resets used func=0 with no pull-up — wrong configuration
 
-**Planned experiment**: Reproduce the exact UEFI TLMM register writes from Linux via `/dev/mem` MMIO, then check if Boot ROM loads.
+### UEFI Sequence Reproduction — TESTED, FAILED (2026-02-12)
+
+Two comprehensive test scripts reproduced the UEFI sequence from Linux:
+
+**v1** (`uefi_touch_init.py`) — GPIO 99 hardware reset (kills DSI):
+- Test A: GPIO 174 HIGH only → 0x04
+- Test B: func=0, pull-up, full sequence → 0x04
+- Test C: UEFI DAL func values (func=15/11) → 0x04
+- Test D: func=0, pull=keeper → 0x04
+- Test E: Baseline (no GPIO 174) → 0x04
+
+**v2** (`uefi_touch_init_v2.py`) — Software system reset (preserves DSI):
+- Test A: GPIO 174 HIGH + system reset → 0x04
+- Test B: GPIO 174 HIGH + reload engine → 0x04
+- Test C: Safe mode + reload + system reset → 0x04
+- Test D: EGoTouchRev sequence via system reset → 0x04
+- Test E: 3x system reset with long waits → 0x04
+- Test F: FW stop + reload + system reset → 0x04
+
+**Additional finding from pinctrl-sc8280xp.c**: GPIO 99 only has functions 0 (gpio) and 1 (rgmii_1). GPIO 174 only has 0 (gpio) and 1 (qup4). The UEFI DAL "func=15/11" values are DAL-internal identifiers, not hardware FUNC_SEL values. UEFI's TLMM residual: GPIO 174 boots with FUNC_SEL=3 (probably 15 mod 4).
+
+**Conclusion**: Boot ROM failure is a **hardware-level issue**, not a software/configuration/GPIO problem. The UEFI sequence reproduction does not trigger Boot ROM. DSI clock preservation makes no difference.
 
 ## Next Steps (Priority Order)
 
-### 1. Reproduce UEFI TouchPanelInit Sequence from Linux (Highest Priority)
-Write TLMM registers via MMIO to replicate the exact UEFI GPIO configuration:
-1. ConfigGpio GPIO 174: func=15, pull-up, output → OUT=HIGH (I2C mode)
-2. ConfigGpio GPIO 99: func=11, pull-up, output → OUT=HIGH (reset release)
-3. Poll IC status for 0x05 (FW running)
-4. If successful: ConfigGpio GPIO 174 → OUT=LOW (switch to SPI mode)
+### 1. Read OTP Registers (Highest Priority)
+The IC's One-Time Programmable fuses may contain boot configuration that differs from Detach0-0's device. Need to find the correct method to read OTP (via `getProjectID_OTP()` equivalent).
 
 ### 2. Compare Registers with Detach0-0's Working Device
 Need Detach0-0 to read these registers on his working system and compare:
