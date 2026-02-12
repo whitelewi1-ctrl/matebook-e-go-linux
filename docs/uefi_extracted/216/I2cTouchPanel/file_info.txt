@@ -1,0 +1,15 @@
+Type: File
+Subtype: DXE driver
+Text: I2cTouchPanel
+Fixed: No
+Offset: 3CDC10h
+File GUID: 8C88DA42-7CA9-40B6-9FD3-473B8A77CC5A
+Type: 07h
+Attributes: 00h
+Full size: 912Ch (37164)
+Header size: 18h (24)
+Body size: 9114h (37140)
+Tail size: 0h (0)
+State: F8h
+Header checksum: D6h, valid
+Data checksum: AAh, valid

@@ -1,0 +1,15 @@
+Type: File
+Subtype: DXE driver
+Text: GpioConfigDxe
+Fixed: No
+Offset: C2E48h
+File GUID: A26DD3C1-F993-418F-91DB-9C21D0F51468
+Type: 07h
+Attributes: 00h
+Full size: 7054h (28756)
+Header size: 18h (24)
+Body size: 703Ch (28732)
+Tail size: 0h (0)
+State: F8h
+Header checksum: CCh, valid
+Data checksum: AAh, valid

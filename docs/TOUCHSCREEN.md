@@ -1,6 +1,25 @@
 # Touchscreen Research Notes
 
-## Status: Not Working — Boot ROM requires UEFI/XBL trigger (all software methods exhausted)
+## Status: UEFI Boot Sequence Reverse-Engineered — Linux Reproduction Pending
+
+## Latest Update (2026-02-12)
+
+**MAJOR BREAKTHROUGH**: Reverse-engineered UEFI `TouchPanelInit` DXE module. The complete UEFI touch initialization sequence is now understood:
+
+1. **DisplayDxe** detects panel ("CSOT_HX83121"), initializes DSI, lights up display
+2. **TouchPanelInit** sets GPIO 174 HIGH (I2C mode) → GPIO 99 HIGH (reset release) → **Boot ROM loads firmware**
+3. **I2cTouchPanel** sets GPIO 174 LOW (switch back to SPI mode) → reads HID descriptor via I2C
+
+**Key discovery**: GPIO 174 = DT02 register! The ACPI `DT02` at `0x0F1AE004` is actually GPIO 174's TLMM IN_OUT register. UEFI uses it as a software flag to switch between I2C and SPI modes.
+
+**Next step**: Reproduce the UEFI sequence from Linux using MMIO writes to TLMM registers.
+
+### Companion Docs
+- `docs/TOUCHSCREEN_LIVE_TEST_2026-02-11.md` — 6 rounds of live testing
+- `docs/TOUCHSCREEN_READ_PLANE_DEBUG_2026-02-11.md` — SPI event plane debug
+- `docs/UEFI_FIRMWARE_TOUCH_ANALYSIS_2026-02-11.md` — UEFI capsule analysis
+- `docs/ACPI_TOUCH_DIFF_216_vs_217.md` — BIOS 2.16 vs 2.17 ACPI comparison
+- `docs/UEFI_DXE_TOUCH_DIFF_216_vs_217.md` — DXE module binary comparison
 
 The MateBook E Go's touchscreen uses the **Himax HX83121A** TDDI (Touch & Display Driver Integration) IC with a **THP (Touchscreen Host Processing) architecture** — the IC outputs raw capacitive data and host-side software computes touch coordinates. On Windows, this requires the `HuaweiThpService` daemon; stopping it disables touch entirely.
 
@@ -303,16 +322,13 @@ Format: 16-byte entries: `[sram_addr(4)][size(4)][fw_offset(4)][flags(4)]`
 - **Uses SPI** via SPBTESTTOOL.sys driver (IOCTLs for SPI full-duplex + GPIO control)
 - **Dual device**: master (THPA/SPI6) + slave (THPB/SPI20)
 
-### Root Cause Hypothesis
-The Boot ROM requires a trigger from UEFI/XBL that occurs during the display initialization phase — possibly a specific DSI command, power sequencing event, or flash controller initialization that we cannot replicate from Linux userspace.
+### Root Cause Hypothesis (Updated 2026-02-12)
 
-**Ruled out**: Flash content mismatch, flash protection, flash CRC, GPIO reset timing, data SRAM configuration, reload engine, software reset, 6.18 MSM DRM disruption (same result on 6.14 simpledrm), firmware variant mismatch (flash confirmed as correct CSOT variant), ACPI _STA conditions (DT02=0, SPI mode confirmed), panel driver GPIO38 reset (blacklist test: IC still 0x04 without panel driver loaded).
+**UEFI reverse engineering reveals the trigger mechanism**: The UEFI `TouchPanelInit` DXE module configures GPIO 99 with specific TLMM settings (func=11, pull-up) and releases the reset while GPIO 174 is HIGH (I2C mode). Our previous Linux reset attempts used simple GPIO toggle (func=0, no pull) — the wrong TLMM configuration may prevent Boot ROM from triggering.
 
-**Remaining possibilities**:
-1. UEFI/XBL sends a specific command during DSI panel init that triggers Boot ROM
-2. Factory flash contains additional data — flash 0x40004=0x00000100 is not from our firmware write
-3. IC OTP is configured for "host-triggered boot" rather than "auto-load on power-on"
-4. Comparison with Detach0-0's IC registers may reveal the difference
+**Ruled out**: Flash content mismatch, flash protection, flash CRC, simple GPIO reset timing, data SRAM configuration, reload engine, software reset, 6.18 MSM DRM disruption (same result on 6.14 simpledrm), firmware variant mismatch (flash confirmed as correct CSOT variant), ACPI _STA conditions (DT02=0, SPI mode confirmed), panel driver GPIO38 reset (blacklist test: IC still 0x04 without panel driver loaded).
+
+**Current hypothesis**: Boot ROM requires the exact TLMM configuration used by UEFI (GPIO 99 func=11, GPIO 174 HIGH for I2C mode) to trigger firmware loading. Simple GPIO toggle with default function select is insufficient.
 
 ## ACPI DSDT Analysis (2026-02-11)
 
@@ -343,9 +359,104 @@ DRM runtime power management (`/sys/class/drm/card*/device/power/control = auto`
 
 Never reset GPIO 99 while the display is active!
 
+## UEFI TouchPanelInit DXE Reverse Engineering (2026-02-12)
+
+Reverse-engineered the three UEFI DXE modules responsible for touch initialization. Binary analysis of `TouchPanelInit.pe32.bin` (28KB ARM64 PE32+) and `I2cTouchPanel.pe32.bin` (36KB ARM64 PE32+) from BIOS 2.16 capsule.
+
+### GPIO 174 = DT02 Register
+
+The ACPI `DT02` at physical address `0x0F1AE004` is the GPIO_IN_OUT register of GPIO 174 in the TLMM register file:
+- `0x0F100000` (TLMM base) + `174 * 0x1000` = `0x0F1AE000` (GPIO 174 config)
+- `0x0F1AE004` = GPIO 174 IN_OUT register
+
+This means:
+- GPIO 174 OUT=HIGH → DT02 ≠ 0 → ACPI selects I2C mode (HIMX device enabled)
+- GPIO 174 OUT=LOW → DT02 = 0 → ACPI selects SPI mode (THPA/THPB enabled)
+- It's not a physical signal — the TLMM register file is used as a software flag
+
+### Complete UEFI Touch Initialization Timeline
+
+```
+Phase 1: DisplayDxe
+  - GetLcdId() detects panel via GPIO LCD_ID0/ID1 → "CSOT_HX83121"
+  - Loads Panel_csot_hx83121_vid.xml
+  - GPIO 38 reset → DSI init → DSC → panel lights up
+  - I2CPanelSendCommandSequence() sends I2C panel commands
+
+Phase 2: TouchPanelInit (GUID 8C88DA42-7CA9-...)
+  - GetVariable("TouchPanelInit", {24c38995-...}, attrs=0x3)
+  - If NOT_FOUND: SetVariable("TouchPanelInit", attrs=0x3, value=1)
+  - GetVariable("I2CWriteAndReadBUSY", same GUID, attrs=0x7)
+  - LocateProtocol(TLMM {ad9aec18-...})
+  - ConfigGpio(0x200FCAE0) → GPIO 174: func=15, pull-up, output
+  - 10ms Stall
+  - GpioOut(0x200E4AE0, 1) → GPIO 174 HIGH (DT02=1, I2C mode)
+  - ConfigGpio(0x200EC630) → GPIO 99: func=11, pull-up, output
+  - 10ms Stall
+  - GpioOut(0x200E4630, 1) → GPIO 99 HIGH (touch reset released)
+  → Boot ROM should load firmware here (status 0x04 → 0x05)
+
+Phase 3: I2cTouchPanel (GUID 8C88DA42-...-CC5A)
+  - GetVariable("TouchPanelInit") reads handshake variable
+  - ConfigGpio(0x200FCAE0) → GPIO 174 config
+  - 10ms Stall
+  - GpioOut(0x200E4AE0, 0) → GPIO 174 LOW (DT02=0, switch to SPI mode)
+  - ReadHidDescriptor() → I2C-HID read at 0x4F
+  - ReadReportDescriptor() → HID report descriptor
+  - Installs TouchDeviceInitProtocol {e7f58a0e-...}
+```
+
+### Qualcomm DALGpioSignalType Encoding
+
+The TLMM `ConfigGpio` parameter is a 32-bit packed value:
+
+| Bits | Field |
+|------|-------|
+| [13:4] | GPIO number |
+| [17:14] | Function select |
+| [19:18] | Pull configuration |
+| [21:20] | Direction |
+
+Values used by UEFI:
+
+| Config Value | GPIO | Func | Purpose |
+|-------------|------|------|---------|
+| 0x200FCAE0 | 174 | 15 | GPIO mode, pull-up, output |
+| 0x200E4AE0 | 174 | 9 | GPIO mode, pull-up, output drive |
+| 0x200EC630 | 99 | 11 | GPIO mode, pull-up, output |
+| 0x200E4630 | 99 | 9 | GPIO mode, pull-up, output drive |
+
+**Important**: UEFI uses `func=11` for GPIO 99, not the default `func=0`. Our previous GPIO 99 reset attempts used simple GPIO toggle without setting the correct TLMM function — this may be why Boot ROM didn't trigger.
+
+### UEFI Variables
+
+| Variable | GUID | Attrs | Linux Visible | Value |
+|----------|------|-------|---------------|-------|
+| TouchPanelInit | {24c38995-...} | 0x3 (NV+BS) | **No** (no RT) | 1 |
+| I2CWriteAndReadBUSY | {24c38995-...} | 0x7 (NV+BS+RT) | Yes | 0x01 |
+
+`TouchPanelInit` has attrs=0x3 (no RUNTIME_ACCESS), so it's invisible to Linux `efivars`. This is a handshake variable between TouchPanelInit and I2cTouchPanel DXE modules.
+
+### Implications for Linux Boot ROM Fix
+
+The UEFI sequence reveals that:
+1. GPIO 174 must be set HIGH (I2C mode) **before** releasing GPIO 99 reset
+2. GPIO 99 needs specific TLMM function/pull configuration (func=11, pull-up)
+3. After Boot ROM loads, GPIO 174 is set LOW to switch back to SPI mode
+4. Our previous GPIO 99 resets used func=0 with no pull-up — wrong configuration
+
+**Planned experiment**: Reproduce the exact UEFI TLMM register writes from Linux via `/dev/mem` MMIO, then check if Boot ROM loads.
+
 ## Next Steps (Priority Order)
 
-### 1. Compare Registers with Detach0-0's Working Device (Highest Priority)
+### 1. Reproduce UEFI TouchPanelInit Sequence from Linux (Highest Priority)
+Write TLMM registers via MMIO to replicate the exact UEFI GPIO configuration:
+1. ConfigGpio GPIO 174: func=15, pull-up, output → OUT=HIGH (I2C mode)
+2. ConfigGpio GPIO 99: func=11, pull-up, output → OUT=HIGH (reset release)
+3. Poll IC status for 0x05 (FW running)
+4. If successful: ConfigGpio GPIO 174 → OUT=LOW (switch to SPI mode)
+
+### 2. Compare Registers with Detach0-0's Working Device
 Need Detach0-0 to read these registers on his working system and compare:
 - `0x900000E0` (boot_stat) — ours is 0x54930000
 - `0x900000E4` (flag_reset) — ours varies (0x00000010/0x00000100)

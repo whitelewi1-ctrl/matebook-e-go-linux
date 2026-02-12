@@ -1,0 +1,15 @@
+Type: File
+Subtype: DXE driver
+Text: I2C
+Fixed: No
+Offset: 353B98h
+File GUID: 04DE8591-D2B3-4077-BBBE-B12070094EB6
+Type: 07h
+Attributes: 00h
+Full size: 9074h (36980)
+Header size: 18h (24)
+Body size: 905Ch (36956)
+Tail size: 0h (0)
+State: F8h
+Header checksum: FAh, valid
+Data checksum: AAh, valid

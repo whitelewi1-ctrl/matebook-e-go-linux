@@ -1,0 +1,15 @@
+Type: File
+Subtype: DXE driver
+Text: WinAcpiUpdate
+Fixed: No
+Offset: F0A740h
+File GUID: 0E28CC67-9688-4303-960C-3BA68F45D938
+Type: 07h
+Attributes: 00h
+Full size: 9078h (36984)
+Header size: 18h (24)
+Body size: 9060h (36960)
+Tail size: 0h (0)
+State: F8h
+Header checksum: BCh, valid
+Data checksum: AAh, valid

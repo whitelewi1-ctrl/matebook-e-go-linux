@@ -1,0 +1,15 @@
+Type: File
+Subtype: DXE driver
+Text: AcpiPlatform
+Fixed: No
+Offset: EF76C8h
+File GUID: 07598DFC-D5EC-4F00-8897-AB10426CB644
+Type: 07h
+Attributes: 00h
+Full size: 13076h (77942)
+Header size: 18h (24)
+Body size: 1305Eh (77918)
+Tail size: 0h (0)
+State: F8h
+Header checksum: D7h, valid
+Data checksum: AAh, valid

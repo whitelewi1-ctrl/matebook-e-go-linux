@@ -1,0 +1,15 @@
+Type: File
+Subtype: DXE driver
+Text: TouchPanelInit
+Fixed: No
+Offset: 3C6BB8h
+File GUID: 8C88DA42-7CA9-40B6-9FD3-473B8A19525A
+Type: 07h
+Attributes: 00h
+Full size: 7056h (28758)
+Header size: 18h (24)
+Body size: 703Eh (28734)
+Tail size: 0h (0)
+State: F8h
+Header checksum: A5h, valid
+Data checksum: AAh, valid

@@ -1,0 +1,15 @@
+Type: File
+Subtype: DXE driver
+Text: SPI
+Fixed: No
+Offset: 592218h
+File GUID: 7A32BD23-F735-4F57-AA1A-447D2FE3BE0D
+Type: 07h
+Attributes: 00h
+Full size: C074h (49268)
+Header size: 18h (24)
+Body size: C05Ch (49244)
+Tail size: 0h (0)
+State: F8h
+Header checksum: 05h, valid
+Data checksum: AAh, valid
