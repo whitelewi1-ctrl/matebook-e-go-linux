@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """
 HX83121A Touch Recovery Service
-Checks if touchscreen firmware is loaded, if not triggers Boot ROM via GPIO reset.
+Triggers Boot ROM via GPIO reset if touchscreen HID is not functional.
+
+Key findings:
+- 0x4F (HID) only ACKs when GPIO 174 is actively driven LOW (OE=1)
+- Panel driver resets GPIO 99 (TDDI shared reset) during init, killing touch
+- After GPIO reset, a failed bind attempt (174 HIGH) is needed to "wake" HID
+- Then unbind + set 174 LOW + rebind succeeds
+
 Deploy: /usr/local/bin/hx83121a-touch-recovery
 """
 import subprocess, struct, time, mmap, os, sys
@@ -10,7 +17,6 @@ TLMM_BASE = 0x0F100000
 I2C_BUS = 4
 AHB_ADDR = 0x48
 HID_ADDR = "4-004f"
-MAX_RETRIES = 3
 
 def log(msg):
     print(f"hx83121a: {msg}", flush=True)
@@ -45,11 +51,12 @@ def ahb_read32(addr):
     v = i2c_read(0x08, 4)
     return struct.unpack("<I", bytes(v))[0] if v else None
 
-def get_status():
-    return ahb_read32(0x900000A8)
+def check_hid_responds():
+    r = subprocess.run(["i2ctransfer", "-y", str(I2C_BUS), "w0@0x4f"],
+                       capture_output=True, text=True)
+    return r.returncode == 0
 
 def check_touch_input():
-    """Check if touch HID device exists in input subsystem."""
     r = subprocess.run(["grep", "-c", "4858:121A", "/proc/bus/input/devices"],
                        capture_output=True, text=True)
     return int(r.stdout.strip()) > 0 if r.returncode == 0 else False
@@ -61,101 +68,112 @@ def unbind_hid():
 def bind_hid():
     subprocess.run(["bash", "-c", f"echo {HID_ADDR} > /sys/bus/i2c/drivers/i2c_hid_of/bind 2>/dev/null"])
 
-def gpio_reset_boot_rom():
-    """UEFI-style GPIO sequence: GPIO174 HIGH -> GPIO99 reset -> wait Boot ROM -> GPIO174 LOW"""
+def recover_touch():
+    """
+    Proven recovery sequence (matches gpio_reset2.py two-round flow):
+    Round 1: unbind → GPIO174 HIGH → GPIO99 reset → Boot ROM → bind (expected to fail, wakes HID)
+    Round 2: unbind → GPIO174 actively LOW → verify 0x4F ACK → bind (succeeds)
+    """
     gpio174_cfg_addr = TLMM_BASE + 174 * 0x1000
     gpio174_io_addr = gpio174_cfg_addr + 4
     gpio99_cfg_addr = TLMM_BASE + 99 * 0x1000
     gpio99_io_addr = gpio99_cfg_addr + 4
 
-    # Save original config
     cfg174_orig = mmio_rw(gpio174_cfg_addr)
     cfg99_orig = mmio_rw(gpio99_cfg_addr)
 
+    # === Round 1: GPIO reset with 174 HIGH, bind (will likely fail) ===
+    unbind_hid()
+
     # GPIO 174 HIGH (I2C mode select)
-    mmio_rw(gpio174_cfg_addr, cfg174_orig | (1 << 9))  # OE
-    mmio_rw(gpio174_io_addr, 0x02)  # HIGH
+    mmio_rw(gpio174_cfg_addr, cfg174_orig | (1 << 9))
+    mmio_rw(gpio174_io_addr, 0x02)
     time.sleep(0.01)
 
     # GPIO 99 reset pulse
-    mmio_rw(gpio99_cfg_addr, cfg99_orig | (1 << 9))  # OE
-    mmio_rw(gpio99_io_addr, 0x00)  # LOW (assert reset)
-    time.sleep(0.05)  # 50ms pulse
-    mmio_rw(gpio99_io_addr, 0x02)  # HIGH (release reset)
-    mmio_rw(gpio99_cfg_addr, cfg99_orig & ~(1 << 9))  # restore input
+    mmio_rw(gpio99_cfg_addr, cfg99_orig | (1 << 9))
+    mmio_rw(gpio99_io_addr, 0x00)
+    time.sleep(0.05)
+    mmio_rw(gpio99_io_addr, 0x02)
+    mmio_rw(gpio99_cfg_addr, cfg99_orig & ~(1 << 9))
 
-    # Wait for Boot ROM (up to 5 seconds)
+    # Wait for Boot ROM
+    boot_ok = False
     for i in range(50):
         time.sleep(0.1)
-        status = get_status()
+        status = ahb_read32(0x900000A8)
         if status == 0x05:
-            elapsed = (i + 1) * 0.1
-            log(f"Boot ROM loaded firmware in {elapsed:.1f}s")
-            # GPIO 174 LOW (SPI mode)
-            mmio_rw(gpio174_io_addr, 0x00)
-            mmio_rw(gpio174_cfg_addr, cfg174_orig)
-            return True
+            log(f"Boot ROM loaded firmware in {(i+1)*0.1:.1f}s")
+            boot_ok = True
+            break
 
-    # Timeout - restore GPIO 174
+    if not boot_ok:
+        log("Boot ROM timeout")
+        mmio_rw(gpio174_io_addr, 0x00)
+        mmio_rw(gpio174_cfg_addr, cfg174_orig)
+        return False
+
+    # Bind with 174 HIGH (expected to fail, but wakes HID interface)
+    log("Round 1: bind with 174 HIGH (wake HID)...")
+    bind_hid()
+    time.sleep(1)
+
+    # === Round 2: unbind, set 174 LOW, rebind ===
+    log("Round 2: unbind + 174 LOW + rebind...")
+    unbind_hid()
+
+    # GPIO 174 actively driven LOW (keep OE=1!)
     mmio_rw(gpio174_io_addr, 0x00)
-    mmio_rw(gpio174_cfg_addr, cfg174_orig)
+    time.sleep(0.5)
+
+    if not check_hid_responds():
+        log("0x4F still NACK after 174 LOW")
+        return False
+
+    log("0x4F ACK confirmed")
+    bind_hid()
+    time.sleep(2)
+
+    if check_touch_input():
+        log("Touch recovered!")
+        return True
+
+    log("Bind OK but no input devices")
     return False
 
 def main():
-    # Check if I2C device exists
     if not os.path.exists(f"/sys/bus/i2c/devices/{HID_ADDR}"):
         log("I2C device not found, skipping")
         return 0
 
-    # Wait briefly for i2c_hid_of to probe
-    for _ in range(10):
-        if check_touch_input():
-            log("Touchscreen already working")
+    # Wait for panel driver to finish init (resets GPIO99 at ~3.9s, done by ~5s)
+    # Poll dmesg instead of fixed sleep for faster start
+    log("Waiting for panel init...")
+    for _ in range(50):
+        r = subprocess.run(["dmesg"], capture_output=True, text=True)
+        if "Init sequence completed" in r.stdout:
+            log("Panel init done")
+            break
+        time.sleep(0.1)
+    else:
+        log("Panel init not detected, proceeding anyway")
+    time.sleep(0.5)  # small settle time after panel init
+
+    # Check if touch is already functional
+    if check_touch_input() and check_hid_responds():
+        log("Touchscreen working (HID responsive)")
+        return 0
+
+    log("Touch not functional, attempting recovery...")
+
+    for attempt in range(1, 4):
+        log(f"Attempt {attempt}/3")
+        if recover_touch():
             return 0
-        time.sleep(0.5)
-
-    log("Touchscreen not detected after 5s, checking IC status...")
-
-    # Unbind HID to access AHB bridge
-    unbind_hid()
-
-    status = get_status()
-    if status is None:
-        log("IC not responding on I2C, cannot recover")
-        bind_hid()
-        return 1
-
-    log(f"IC status: 0x{status:02X}")
-
-    if status == 0x05:
-        log("Firmware running but no HID device, rebinding...")
-        bind_hid()
         time.sleep(2)
-        if check_touch_input():
-            log("Touch restored by rebind")
-            return 0
-        log("Rebind didn't help")
-        return 1
 
-    # Status != 0x05, try Boot ROM recovery
-    for attempt in range(1, MAX_RETRIES + 1):
-        log(f"Recovery attempt {attempt}/{MAX_RETRIES}: GPIO reset + Boot ROM...")
-
-        if gpio_reset_boot_rom():
-            # Boot ROM succeeded, rebind HID
-            bind_hid()
-            time.sleep(2)
-            if check_touch_input():
-                log(f"Touch recovered on attempt {attempt}!")
-                return 0
-            else:
-                log("Boot ROM OK but HID not detected, retrying...")
-                unbind_hid()
-        else:
-            log(f"Boot ROM failed on attempt {attempt}")
-
-    log(f"Recovery failed after {MAX_RETRIES} attempts")
-    bind_hid()  # rebind anyway
+    log("Recovery failed")
+    bind_hid()
     return 1
 
 if __name__ == "__main__":

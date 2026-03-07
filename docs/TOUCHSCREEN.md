@@ -1,99 +1,71 @@
 # Touchscreen Research Notes
 
-## Status: Boot ROM Recovery CONFIRMED Working!
+## Status: Fully Working — Automatic Boot ROM Recovery
 
 ## Latest Update (2026-03-08)
 
-### Boot ROM Recovery from Linux — VERIFIED!
+### Touchscreen Fully Working on NVMe Arch Linux
 
-Previous conclusion that "Boot ROM never works" was **WRONG** — it was tested only after Windows had been deleted, which changes UEFI behavior. With correct conditions, Boot ROM reliably loads firmware via GPIO 99 reset.
+The HX83121A touchscreen now works reliably on the internal NVMe Arch Linux installation with automatic recovery at every boot. No Windows installation required.
 
-**Key findings (2026-03-08):**
+**Root cause chain (fully understood):**
 
-1. **Boot ROM works reliably** — GPIO 99 hardware reset triggers Boot ROM to copy firmware from flash to Code SRAM. Status goes 0x04 → 0x05 within 0.5s.
+1. **UEFI `TouchPanelInit` DXE only runs on certain boot paths** — when booting from the NVMe with our GRUB (not the original Windows Boot Manager), UEFI skips touch initialization. The IC stays at status=0x04 (idle).
 
-2. **Code SRAM 0x78787878 is normal** — This is hardware read-protection, NOT "empty" or "broken". Code SRAM returns 0x78787878 even when firmware IS running (status=0x05). This is by design.
+2. **Panel driver kills touch firmware** — the `panel-himax-hx83121a` kernel driver resets GPIO 99 during `hx83121a_prepare()` at ~3.9s after boot. Since HX83121A is TDDI (shared display+touch reset), this kills any touch firmware that was loaded.
 
-3. **Xiaomi SRAM direct-write does NOT work on our IC** — TCON+ADC reset (0x80020020/0x80020094) does not unlock Code SRAM write protection. These registers are unreadable. Our HX83121A silicon revision handles SRAM protection differently from Xiaomi's devices.
+3. **Boot ROM recovery works from Linux** — GPIO 99 hardware reset triggers Boot ROM to reload firmware from on-chip flash. Status goes 0x04 → 0x05 within ~0.1s.
 
-4. **UEFI TouchPanelInit depends on Windows installation** — When Windows is completely deleted from the NVMe, UEFI's own touch initialization fails (even UEFI setup pages lose touch). The exact dependency is unknown (likely EFI NVRAM variables or ESP contents). Secure Boot is currently OFF, so it's not a Secure Boot issue.
+4. **HID interface requires two-round bind sequence** — after Boot ROM loads firmware, the HID address 0x4F only responds when GPIO 174 is actively driven LOW (OE=1). A "wake" bind with 174 HIGH followed by unbind + 174 LOW + rebind is required.
 
-5. **Recovery service deployed** — `hx83121a-touch-recovery.service` automatically triggers Boot ROM via GPIO reset if touch is not detected at boot. Located at `/usr/local/bin/hx83121a-touch-recovery`.
+**Recovery service**: `hx83121a-touch-recovery.service` runs at boot, waits for panel init to complete (by monitoring dmesg), then performs the two-round GPIO reset + bind sequence. Total recovery time: ~7 seconds from boot.
 
-**Recovery sequence (UEFI-style):**
+### Key Discoveries (2026-03-08)
+
+1. **Boot ROM works reliably** — GPIO 99 reset triggers Boot ROM to copy firmware from flash to Code SRAM. Confirmed across 10+ reboots.
+
+2. **Code SRAM 0x78787878 is normal** — hardware read-protection, NOT "empty". Returns 0x78787878 even when firmware IS running (status=0x05).
+
+3. **Xiaomi SRAM direct-write does NOT work on our IC** — TCON+ADC reset (0x80020020/0x80020094) does not unlock Code SRAM. These registers are unreadable on our silicon revision.
+
+4. **Touch survives Windows deletion** — contrary to earlier assumption, deleting Windows does NOT permanently kill touch. The issue was always about UEFI boot path, not Windows presence.
+
+5. **GPIO 174 must be actively driven LOW for HID** — 0x4F (HID interface) NACKs when GPIO 174 floats (OE=0). Must keep OE=1 and drive LOW.
+
+6. **Two-round bind is required** — binding with GPIO 174 HIGH fails but "wakes" the HID interface. Second bind with 174 LOW succeeds. Single-round recovery always fails.
+
+### Recovery Sequence (proven reliable)
+
 ```
-GPIO 174 HIGH (I2C mode) → 10ms wait →
-GPIO 99 LOW (50ms reset pulse) → GPIO 99 HIGH →
-Wait for status=0x05 (Boot ROM loads from flash, ~0.5s) →
-GPIO 174 LOW (SPI mode)
+1. Wait for panel init (monitor dmesg for "Init sequence completed")
+2. Unbind i2c_hid_of from 4-004f
+3. GPIO 174 HIGH (OE=1) — I2C mode select
+4. GPIO 99 LOW 50ms → HIGH — reset pulse
+5. Wait for status=0x05 via AHB bridge (0x48) — Boot ROM loads ~0.1s
+6. Bind i2c_hid_of (fails, but wakes HID interface)
+7. Wait 1s
+8. Unbind i2c_hid_of
+9. GPIO 174 LOW (keep OE=1!) — HID interface becomes responsive
+10. Wait 0.5s, verify 0x4F ACKs
+11. Bind i2c_hid_of — touch input devices appear
 ```
 
-**Unresolved:** Will Boot ROM still work after Windows is deleted? Cannot be tested without actually deleting Windows. The recovery service is deployed as a safety net.
+### Deployment
+
+```bash
+# Copy recovery script
+cp tools/touchscreen/hx83121a-touch-recovery /usr/local/bin/
+chmod +x /usr/local/bin/hx83121a-touch-recovery
+
+# Install and enable service
+cp tools/touchscreen/hx83121a-touch-recovery.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable hx83121a-touch-recovery.service
+```
 
 ### Previous: Direct SRAM Write Method (2026-02-14) — DOES NOT WORK
 
 ~~Discovered direct SRAM write via Xiaomi hxchipset driver.~~ Tested on 2026-03-08: Code SRAM remains 0x78787878 after TCON+ADC reset. **This approach is invalid for our IC revision.**
-
-## Previous Update (2026-02-14)
-
-### Direct SRAM Write Method Discovered!
-
-Reverse-engineered both the Huawei `himax_thp_drv.dll` and the [Xiaomi open-source hxchipset kernel driver](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/tree/dagu-s-oss/drivers/input/touchscreen/hxchipset). Key findings:
-
-1. **The Huawei DLL does NOT write firmware directly to Code SRAM** — it only programs flash via SPI200 and relies on Boot ROM (GPIO reset → wait status=0x05). When Boot ROM fails, the DLL retries 5 times and gives up.
-
-2. **The Xiaomi kernel driver DOES write directly to Code SRAM (0x08000000)!** The crucial steps we were missing:
-   - System reset (0x90000018 = 0x55)
-   - Enter safe mode (I2C password 0x31=0x27, 0x32=0x95) → status must become 0x0C
-   - **Reset TCON (0x80020020 = 0x00000000)** ← WE WERE MISSING THIS!
-   - **Reset ADC (0x80020094 = 0x00, then 0x01)** ← AND THIS!
-   - After TCON+ADC reset, Code SRAM at 0x08000000 becomes writable via standard AHB bus
-   - Write firmware in 4096-byte chunks → sense_on → status becomes 0x05
-
-3. **A firmware loading tool has been created**: `tools/touchscreen/load_firmware_i2c.py`
-
-This approach **completely bypasses Boot ROM** — we don't need it to work at all!
-
-### I2C-HID Confirmed Working (2026-02-13)
-
-After Windows THP driver loads firmware (status=0x05), warm-rebooting to Linux gives a fully functional touchscreen:
-- `i2c_hid_of` + `hid-multitouch` → Touchscreen + Stylus input devices
-- **Protocol B multitouch, 10 slots, 60Hz, correct coordinates**
-- VID:PID = 4858:121A, INPUT_PROP_DIRECT, ABS range 0-4096
-
-**Critical issue: DPMS kills firmware permanently.** TDDI IC loses SRAM when display powers off. `keep-display-on.service` is mandatory.
-
-### Previous: UEFI Sequence (2026-02-12)
-Reverse-engineered UEFI `TouchPanelInit` DXE module and reproduced the exact sequence from Linux. Boot ROM still does not load (status stays 0x04). This is a hardware-level issue — our device's Boot ROM has never worked (can't touch in BIOS).
-
-### Companion Docs
-- `docs/TOUCHSCREEN_LIVE_TEST_2026-02-11.md` — 6 rounds of live testing
-- `docs/TOUCHSCREEN_READ_PLANE_DEBUG_2026-02-11.md` — SPI event plane debug
-- `docs/UEFI_FIRMWARE_TOUCH_ANALYSIS_2026-02-11.md` — UEFI capsule analysis
-- `docs/ACPI_TOUCH_DIFF_216_vs_217.md` — BIOS 2.16 vs 2.17 ACPI comparison
-- `docs/UEFI_DXE_TOUCH_DIFF_216_vs_217.md` — DXE module binary comparison
-
-The MateBook E Go's touchscreen uses the **Himax HX83121A** TDDI (Touch & Display Driver Integration) IC with a **THP (Touchscreen Host Processing) architecture** — the IC outputs raw capacitive data and host-side software computes touch coordinates. On Windows, this requires the `HuaweiThpService` daemon; stopping it disables touch entirely.
-
-We have established communication via both **I2C** (AHB bridge at 0x48) and **SPI** (Mode 3, Himax protocol via spidev0.0 on SPI6). Firmware has been successfully programmed to on-chip flash via the SPI200 controller and **verified 100% byte-by-byte**. Flash is **unprotected** (SR1/2/3=0x00, Puya P25Q40H chip). CRC is correct. However, the **boot ROM refuses to load firmware** regardless of the method used — GPIO hardware reset, software system reset, full EGoTouchRev sequence reproduction, or reload engine manipulation. The IC stays at status=0x04 (idle) instead of 0x05 (FW running).
-
-On a confirmed working system (Detach0-0), IC status is already 0x05 **before any driver runs**, indicating UEFI/XBL triggers Boot ROM during the display initialization phase. Our UEFI/XBL does not appear to do this.
-
-### Ruled Out Causes
-- Flash content (byte-by-byte verified against DLL firmware)
-- Flash protection (SR1/SR2/SR3 = 0x00)
-- Flash CRC (fixed, HW CRC = 0)
-- GPIO hardware reset (IC resets correctly)
-- All software trigger methods (10+ different approaches)
-- Firmware variant (CSOT panel confirmed correct)
-- ACPI _STA conditions (DT02=0, SPI mode correct)
-- Panel driver GPIO38 reset (blacklist test: IC still 0x04 without panel driver)
-
-### Key Evidence from IC Register Dump (2026-02-11)
-- **Code SRAM reads 0x78787878** — confirmed by Detach0-0 to mean "hardware inaccessible", not "empty"
-- **Data SRAM is random garbage after reboot** — Boot ROM never initializes anything (flash_reload, sorting_mode, reload_done all random)
-- **flag_reset(E4) varies between boots** — 0x00000010 vs 0x00000100, reflecting different reset types
-- **Flash 0x40004 = 0x00000100** — non-erased data beyond firmware area, not written by us (factory/UEFI?)
 
 ## Hardware
 
@@ -110,6 +82,7 @@ On a confirmed working system (Detach0-0), IC status is already 0x05 **before an
 | Max touch points | 10 |
 | Interrupt GPIO | tlmm 175 (active low) |
 | Reset GPIO | tlmm 99 (active low) — **WARNING: resets display too (TDDI)** |
+| Mode Select GPIO | tlmm 174 — HIGH=I2C mode, LOW=SPI mode (also ACPI DT02 register at 0x0F1AE004) |
 | I2C SDA/SCL | GPIO 171/172 (qup4 function) |
 | SPI MISO/MOSI/CLK/CS | GPIO 154/155/156/157 (qup6 function) |
 | Power supply | vreg_misc_3p3 (VCC3B), vreg_s10b |
@@ -124,49 +97,34 @@ The DSDT defines three mutually exclusive touch interfaces, selected by firmware
 | THPB (HIMX0002) | SPI20 | GPIO 39, 12MHz | DT02==0 → 0x0F | Stylus (SPI) |
 | HIMX (HIMX1234) | I2C5 | addr 0x4F, 1MHz | DT02!=0 → 0x0F | I2C HID (PNP0C50) |
 
-**DT02 register** at physical address 0x0F1AE004 (OperationRegion T174, SystemMemory):
-- Our value: **DT02 = 0x00000000** → SPI mode (THPA+THPB enabled, HIMX disabled)
-- Written by UEFI/XBL at boot time
-- Verified by custom kernel module (`read_dt02.c` using `memremap()`)
+**DT02 register** at physical address 0x0F1AE004 (GPIO 174 IN_OUT register in TLMM):
+- GPIO 174 OUT=HIGH → DT02 ≠ 0 → I2C mode (HIMX enabled)
+- GPIO 174 OUT=LOW → DT02 = 0 → SPI mode (THPA/THPB enabled)
 
-**Note**: I2C HID address 0x4F is for HID event interface; 0x48 is for AHB bridge register/firmware access.
+## I2C-HID — CONFIRMED WORKING
 
-## SPI Communication — Working!
+When IC firmware is running (status=0x05), the standard Linux I2C-HID stack works:
+- `i2c_hid_of` probes 0x4F → HID descriptor (30 bytes, 712-byte report descriptor)
+- `hid-multitouch` creates: Touchscreen (5 contacts, Protocol B) + Stylus input devices
+- 60Hz report rate, ABS_MT_POSITION_X/Y 0-4096, ABS_PRESSURE 0-255, 10 slots
+- VID:PID = 4858:121A, INPUT_PROP_DIRECT
+- **No custom THP driver needed** — IC handles coordinate computation in I2C-HID mode
 
-SPI6 communicates with the HX83121A using the Himax bus command protocol:
+## GPIO 99 Reset
 
-### Bus Commands (SPI)
-```
-Write: [0xF2, cmd, params...]          - WriteBus (full duplex, TX only)
-Read:  [0xF3, cmd, 0x00, 0x00...]      - ReadBus (full duplex, skip 3 bytes then read)
-```
+Direct MMIO access for GPIO 99 hardware reset:
 
-### AHB Read (SPI)
 ```python
-burst_enable(1)                              # 0x0D=0x13, 0x13=0x31
-hw(0x00, addr_LE_4B)                         # Set address
-hw(0x0C, [0x00])                             # Direction = read
-data = hr(0x08, 4)                           # Read 4 bytes
-```
+TLMM_BASE = 0x0F100000
+cfg_addr = TLMM_BASE + 99 * 0x1000    # 0x0F163000
+io_addr = cfg_addr + 4                 # 0x0F163004
 
-### AHB Write (SPI)
-```python
-burst_enable(1)                              # 0x0D=0x13, 0x13=0x31
-hw(0x00, addr_LE_4B + data_LE_4B)            # Address + data combined
-```
-
-### Burst Enable
-```python
-hw(0x0D, [0x12 | state])    # state=1 for burst (>4B), state=0 for single (≤4B)
-hw(0x13, [0x31])             # CONTI enable
-```
-
-### Safe Mode (Password Unlock)
-```python
-hw(0x31, [0x27])             # Password byte 1
-hw(0x32, [0x95])             # Password byte 2
-# Verify: read back 0x31→0x27, 0x32→0x95
-# Status (0x900000A8) becomes 0x0C (safe mode)
+cfg |= (1 << 9)       # Set OE bit
+write(cfg_addr, cfg)
+write(io_addr, 0x00)   # LOW (reset asserted), wait 50ms
+write(io_addr, 0x02)   # HIGH (reset released)
+cfg &= ~(1 << 9)       # Clear OE (return to input)
+write(cfg_addr, cfg)
 ```
 
 ## I2C AHB Bridge Protocol
@@ -178,29 +136,16 @@ Write: i2c_write([cmd, params...])
 Read:  i2c_write([cmd]), then i2c_read(N)
 ```
 
-Bus commands are identical: 0x00 (addr), 0x08 (read data), 0x0C (direction), 0x0D (INCR4=0x12), 0x13 (CONTI=0x31), 0x31/0x32 (password).
+Bus commands: 0x00 (addr), 0x08 (read data), 0x0C (direction), 0x0D (INCR4=0x12), 0x13 (CONTI=0x31), 0x31/0x32 (password).
 
-## GPIO 99 Reset — Working!
+## SPI Communication
 
-Direct MMIO access for GPIO 99 hardware reset:
+SPI6 communicates using the Himax bus command protocol:
 
-```python
-TLMM_BASE = 0x0F100000
-cfg_addr = TLMM_BASE + 99 * 0x1000    # 0x0F163000
-io_addr = cfg_addr + 4                 # 0x0F163004
-
-# IMPORTANT: After reboot, OE=0 (input mode). Must set OE=1 first!
-cfg |= (1 << 9)       # Set OE bit
-write(cfg_addr, cfg)
-
-# Reset sequence:
-write(io_addr, 0x00)   # LOW (reset asserted), wait 20ms
-write(io_addr, 0x02)   # HIGH (reset released)
-cfg &= ~(1 << 9)       # Clear OE (return to input)
-write(cfg_addr, cfg)
 ```
-
-**Verification**: IC returns 0xFFFFFFFF during reset LOW, recovers after release.
+Write: [0xF2, cmd, params...]          - WriteBus (full duplex, TX only)
+Read:  [0xF3, cmd, 0x00, 0x00...]      - ReadBus (full duplex, skip 3 bytes then read)
+```
 
 ## Flash Programming — Verified 100%
 
@@ -208,145 +153,6 @@ Firmware programmed to on-chip flash via SPI200 controller (0x80000xxx):
 - **Size**: 261,120 bytes (full firmware binary)
 - **Method**: SPI200 write-enable + page-program commands
 - **Verification**: All bytes match — header ("HX83121-A"), partition table, code sections, config sections
-- **Persistence**: Survives GPIO reset and tablet reboot (cold power cycle not yet tested)
-
-## AHB Address Space Writability (Definitive — I2C AND SPI tested)
-
-| Address Region | Size | Read | Write | Purpose |
-|---|---|---|---|---|
-| 0x00000000 - 0x0003FFFF | 256KB | OK | **NO** (silent drop) | Flash/ROM read window |
-| 0x08000000 - 0x0801FFFF | 128KB | OK | **NO** (silent drop) | Code SRAM — firmware target |
-| 0x10006000 - 0x10007FFF | 8KB | OK | **YES** | FW config/data registers |
-| 0x20000000 - 0x2001FFFF | 128KB | OK | **YES** (single-word) | Data SRAM |
-| 0x80000000 - 0x80050xxx | varies | OK | **YES** | SPI200 / Flash / Reload controllers |
-| 0x90000000 - 0x900880FF | varies | OK | **YES** (partial) | IC core registers |
-
-## Code SRAM Write — ALL Methods Failed (I2C AND SPI)
-
-Every attempt to write to 0x08000xxx returns 0x78787878 ("inaccessible" — confirmed by Detach0-0):
-
-| # | Method | Result |
-|---|--------|--------|
-| 1 | Standard AHB write (0x00+addr+data) | FAIL |
-| 2 | Safe mode (password unlock 0x31/0x32) | FAIL |
-| 3 | MCU off (bus cmd 0x82 = 0xDA) | FAIL |
-| 4 | FW stop (0x9000005C = 0xA5) + TCON/ADC off | FAIL |
-| 5 | Direction register = write (0x0C = 0x01) | FAIL |
-| 6 | All INCR4 values (0x10, 0x11, 0x12, 0x13, 0xFF) | FAIL |
-| 7 | No burst mode (single word) | FAIL |
-| 8 | Immediate post-reset write (within 1-2ms) | FAIL |
-| 9 | Oncell flash unlock sequence (magic to 0x00-0x0C) | FAIL |
-| 10 | All above via I2C AND SPI | FAIL |
-
-**Conclusion**: Code SRAM has **hardware write protection** that cannot be disabled from the SPI/I2C bus. Only the IC's internal hardware (boot ROM / reload engine) can write to it.
-
-## Boot ROM — ALL Methods Exhausted, NOT Loading
-
-### Verified OK
-- Flash content 100% matches DLL-extracted firmware (byte-by-byte comparison via I2C AHB bridge)
-- Flash not protected (SPI Status Register 1/2/3 = 0x00)
-- Flash CRC correct (0x7D4E5A69 at 0x3FBFC → HW CRC = 0)
-- Flash header "HX83121-A" present at flash address 0x00000
-- GPIO99 reset works correctly (IC resets, I2C communication recovers)
-- IC responds with correct ID (0x83121A00) after every reset
-
-### After Every Reset Attempt
-- **Status (0x900000A8)**: 0x04 (idle) — **never** reaches 0x05 (FW running)
-- **reload_done (0x100072C0)**: random garbage — Boot ROM never initializes Data SRAM
-- **Code SRAM**: 0x78787878 at all addresses — "inaccessible" (hardware gated, not empty)
-- **Data SRAM**: random values after reboot (flash_reload=garbage, sorting_mode=garbage)
-- **reload_status (0x80050000)**: 0x00000012 (initial)
-- **Boot stat (0x900000E0)**: 0x54930000 (sometimes read fails — intermittent)
-- **flag_reset (0x900000E4)**: varies per boot (0x00000010 or 0x00000100)
-- **Flash data**: Intact and correct
-- **Flash 0x40004**: 0x00000100 (non-erased data beyond firmware area, origin unknown)
-
-### All Failed Boot Attempts
-
-| # | Method | Tool | Result |
-|---|--------|------|--------|
-| 1 | GPIO99 hardware reset (20ms LOW) | C tool via gpiochip4 | 0x04 |
-| 2 | System reset (0x90000018=0x55) | I2C AHB write | 0x04 |
-| 3 | 5× GPIO reset (EGoTouchRev hx_sense_on sequence) | GPIO + I2C | 0x04 |
-| 4 | Safe mode + data SRAM config + GPIO reset | I2C + GPIO | 0x04 |
-| 5 | Reload engine activ_relod (0xEC to 0x90000048) | I2C | reload_status changes, no SRAM copy |
-| 6 | Oscillator enable (0x900880A8/E0) before reset | I2C | 0x04 |
-| 7 | Flash auto mode (0x80000004) | I2C | 0x04 |
-| 8 | Long reset pulse (500ms) | GPIO | 0x04 |
-| 9 | Config partitions written from FW binary | I2C | 0x04 |
-| 10 | Full EGoTouchRev init_buffers + hx_sense_on(true) | GPIO + I2C | 0x04 |
-
-### Full EGoTouchRev Sequence Reproduction (Test #10 detail)
-Following the **exact** sequence from [Detach0-0's Windows driver](https://github.com/awarson2233/EGoTouchRev-rebuild):
-
-1. GPIO99 reset (bus_fail handler: hw_reset slave+master)
-2. check_bus + burst_enable
-3. init_buffers_and_register (clear 0x10007550 80B + 0x1000753C 4B)
-4. Enter safe mode (0x31=0x27, 0x32=0x95)
-5. hx_set_N_frame(1) — write 0x01 then 0x7F0C0001 to 0x10007294
-6. hx_reload_set(0) — write 0x00000000 to 0x10007F00 (enable flash reload)
-7. hx_switch_mode(RAWDATA) — write 0x00000000 to 0x10007F04
-8. 5× retry: clear 0x100072C0, GPIO99 reset, burst_enable, poll status
-9. Fallback: software system reset (0x90000018=0x55)
-
-**Result**: Status stays at 0x04 through all 5 HW reset attempts + SW reset. Boot ROM does not load firmware.
-
-### Flash Protection Check
-Via SPI200 RDSR/JEDEC commands through I2C AHB bridge:
-- Flash SR1 = 0x00 (no block protect, no write enable latch)
-- Flash SR2 = 0x00 (no quad enable, no security bits)
-- Flash SR3 = 0x00 (no write protect)
-- JEDEC ID = 0x856013 (Puya P25Q40H, 4Mbit/512KB)
-
-### Reload Engine Investigation
-- Writing 0xEC to activ_relod (0x90000048) changes reload_status from 0x12 to 0x10
-- But NO data is copied to code SRAM
-- CRC registers (0x80050018) stay at 0xFFFFFFFF
-- Pre-configuring reload_addr_from/cmd_beat has no effect
-
-### Conclusion (UPDATED 2026-03-08)
-~~Boot ROM cannot be triggered from Linux.~~ **CORRECTED:** Boot ROM CAN be triggered from Linux via GPIO 99 hardware reset. Previous failures were in a post-Windows-deletion state where UEFI hadn't initialized the IC environment. Recovery tool: `tools/touchscreen/hx83121a-touch-recovery`
-
-## Firmware Analysis
-
-### Firmware Binary
-- **File**: `hx83121a_gaokun_fw.bin` (261,120 bytes / 0x3FC00)
-- **Source**: Extracted from Windows `himax_thp_drv.dll` driver (Copy4 variant)
-- **Header**: "HX83121-A", date 2022-09-27 19:30:56
-- **Variant**: CSOT panel (confirmed by flash byte-by-byte match)
-
-### Panel Variants (from himax_thp_drv.dll in Gaokun_THP_Software_1.0.1.39.exe)
-
-The DLL embeds **3 full firmware copies** for different panel types, selected by OTP project ID:
-
-| DLL Offset | Date | MD5 | Panel Type |
-|-----------|------|-----|------------|
-| 0x0681c0 | 19:32:44 | 4454a1c2... | BOE (estimated) |
-| 0x0a7dc0 | 19:34:25 | aaf608db... | CSOT New (estimated) |
-| 0x0e79c0 | 19:30:56 | e538f2f6... | **CSOT — our device** |
-
-4 panel types referenced in DLL strings: "Found CSOT panel!", "Found CSOT New panel!", "Found BOE new panel!", "Found BOE old panel!". Selection is done by `hx_firmware_remapping()` based on `getProjectID_OTP()` + CG Color + Sensor ID.
-
-**Our device's flash matches Copy4 (CSOT) exactly** — firmware variant mismatch has been ruled out as the Boot ROM failure cause.
-
-### Partition Table (flash offset 0x20030)
-
-Format: 16-byte entries: `[sram_addr(4)][size(4)][fw_offset(4)][flags(4)]`
-
-| # | SRAM Addr | Size | FW Offset | Flags | Type | Dest |
-|---|-----------|------|-----------|-------|------|------|
-| 0 | 0x00000400 | 8,192 | 0x00000400 | 0x0A | Code | → 0x08000400 |
-| 1 | 0x00002400 | 109,056 | 0x00002400 | 0x00 | Code | → 0x08002400 |
-| 2 | 0x0001CE00 | 5,376 | 0x0001CE00 | 0x00 | Code | → 0x0801CE00 |
-| 3 | 0x0001E300 | 5,376 | 0x0001E300 | 0x00 | Code | → 0x0801E300 |
-| 4 | 0x0001F800 | 1,024 | 0x0001F800 | 0x00 | Code | → 0x0801F800 |
-| 5 | 0x10007000 | 120 | 0x00021400 | 0x00 | Config | FW regs |
-| 6 | 0x10007084 | 528 | 0x000214FE | 0x00 | Config | FW regs |
-| 7 | 0x10007300 | 180 | 0x00021E00 | 0x00 | Config | FW regs |
-| 8 | 0x100072F0 | 16 | 0x00021DD0 | 0x00 | Config | FW regs |
-| 9 | 0x100073F0 | 32 | 0x00021DE0 | 0x00 | Config | FW regs |
-
-**Note**: Code partition sram_addr values are offsets within code SRAM (0x08000000 + sram_addr). Config partitions go directly to FW register addresses. 0x10007F00 (flash_reload) and 0x10007F04 (sorting_mode) are NOT in any config partition.
 
 ## Key Register Map
 
@@ -356,324 +162,94 @@ Format: 16-byte entries: `[sram_addr(4)][size(4)][fw_offset(4)][flags(4)]`
 | Status | 0x900000A8 | 0x04=idle, 0x05=FW running, 0x0C=safe mode | Central state |
 | System Reset | 0x90000018 | write 0x55 | Reset IC CPU |
 | FW ISR Control | 0x9000005C | write 0xA5 | FW stop |
-| activ_relod | 0x90000048 | write 0xEC | Trigger reload (doesn't work) |
-| Reset Event | 0x900000E4 | varies | Flag: reset occurred |
 | Flash Reload | 0x10007F00 | 0x00=enable, 0xA55A=disable | Boot ROM reload control |
 | Reload Done | 0x100072C0 | expect 0x72C0 when FW loaded | Boot ROM completion flag |
 | Sorting Mode | 0x10007F04 | 0x9999=awaiting FW, 0x0000=normal | IC mode |
-| Reload Status | 0x80050000 | 0x12=initial, 0x01000000=after activ_relod | HW reload engine |
-| Reload CRC32 | 0x80050018 | 0xFFFFFFFF=not computed | HW CRC result |
-| Flash Checksum | 0x80000044 | 0x00000000 | Flash checksum register |
 
-## EGoTouchRev Analysis
+## UEFI TouchPanelInit DXE Reverse Engineering
 
-[Detach0-0's Windows driver](https://github.com/awarson2233/EGoTouchRev-rebuild) is a userspace touch driver for Windows ARM64. Key findings:
-
-- **Does NOT download firmware** — assumes boot ROM loads FW from flash
-- **Boot sequence**: GPIO reset → check status=0x05 → poll reload_done=0x72C0
-- **Uses SPI** via SPBTESTTOOL.sys driver (IOCTLs for SPI full-duplex + GPIO control)
-- **Dual device**: master (THPA/SPI6) + slave (THPB/SPI20)
-
-### Root Cause Hypothesis (Updated 2026-03-08)
-
-**CORRECTED: Boot ROM DOES work on this device.** Previous conclusion was wrong because all testing was done after Windows had been deleted from the NVMe, which changes UEFI's initialization behavior.
-
-**Confirmed (2026-03-08):**
-- Boot ROM reliably loads firmware after GPIO 99 reset (tested 5+ times)
-- Recovery from status=0x04 to 0x05 takes ~0.5s
-- `reload_done = 0x72C0` confirms proper Boot ROM completion
-- Touch fully functional after recovery (i2c_hid_of + hid-multitouch)
-
-**Current root cause:** UEFI's `TouchPanelInit` DXE module depends on something related to the Windows installation on the NVMe. When Windows is completely deleted:
-- UEFI setup pages lose touch capability
-- Boot ROM is never triggered during UEFI boot
-- IC stays at status=0x04
-
-Possible dependencies (not yet verified):
-1. **EFI NVRAM variables** — `TouchPanelInit` (attrs=0x3, NV+BS, invisible to Linux) or `I2CWriteAndReadBUSY` (value=0x01)
-2. **ESP contents** — Windows Boot Manager presence may affect UEFI DXE dispatch
-3. **OemConfig variable** — 440-byte config blob with unknown fields at offset 0xB0-0xD0
-4. **Boot flow path** — UEFI may skip TouchPanelInit when no Windows boot target exists
-
-**NOT the cause:**
-- Secure Boot (currently disabled, touch works)
-- Hardware defect (Boot ROM proven functional)
-- Flash content (verified correct)
-- Silicon revision (Boot ROM works fine)
-
-## ACPI DSDT Analysis (2026-02-11)
-
-DSDT successfully dumped (137,829 bytes, OEM=HUAWEI, TBL=SDM8280) via custom kernel module using `memremap()` (our kernel has CONFIG_ACPI=n).
-
-### SPI/I2C Mutual Exclusion (DT02 Register)
-The UEFI writes a mode selector at physical address 0x0F1AE004. Our device has DT02=0, selecting SPI mode.
-
-### Panel Driver Reset Exclusion Test
-**Hypothesis**: Panel driver's GPIO38 reset at probe time kills XBL-loaded firmware.
-
-**Test**: Booted with `modprobe.blacklist=panel_himax_hx83121a` — no panel driver loaded at all.
-
-**Result**: IC status = 0x04. Boot ROM does NOT load even without the panel driver. This definitively proves the issue is NOT caused by our Linux panel driver. XBL never triggers Boot ROM on our device in the first place.
-
-**Bonus finding**: I2C AHB bridge (0x48) works without DSI initialization — contrary to earlier assumption.
-
-## DPMS Power Management Warning
-
-DRM runtime power management (`/sys/class/drm/card*/device/power/control = auto`) causes DPMS Off after a few minutes of idle time. When the DSI link goes down, the TDDI IC becomes completely unreachable via I2C (0x48 returns "No such device or address"). The `keep-display-on.service` prevents this by periodically poking the console and forcing DRM power to "on".
-
-## TDDI Coupling Warning
-
-**CRITICAL**: The HX83121A is a TDDI IC. Resetting via GPIO 99 also resets the display controller:
-- DSI link errors (byte_clk stuck)
-- Display goes black
-- Requires full system reboot to recover
-
-Never reset GPIO 99 while the display is active!
-
-## UEFI TouchPanelInit DXE Reverse Engineering (2026-02-12)
-
-Reverse-engineered the three UEFI DXE modules responsible for touch initialization. Binary analysis of `TouchPanelInit.pe32.bin` (28KB ARM64 PE32+) and `I2cTouchPanel.pe32.bin` (36KB ARM64 PE32+) from BIOS 2.16 capsule.
-
-### GPIO 174 = DT02 Register
-
-The ACPI `DT02` at physical address `0x0F1AE004` is the GPIO_IN_OUT register of GPIO 174 in the TLMM register file:
-- `0x0F100000` (TLMM base) + `174 * 0x1000` = `0x0F1AE000` (GPIO 174 config)
-- `0x0F1AE004` = GPIO 174 IN_OUT register
-
-This means:
-- GPIO 174 OUT=HIGH → DT02 ≠ 0 → ACPI selects I2C mode (HIMX device enabled)
-- GPIO 174 OUT=LOW → DT02 = 0 → ACPI selects SPI mode (THPA/THPB enabled)
-- It's not a physical signal — the TLMM register file is used as a software flag
+Reverse-engineered from BIOS capsule. Three DXE modules handle touch init:
 
 ### Complete UEFI Touch Initialization Timeline
 
 ```
 Phase 1: DisplayDxe
-  - GetLcdId() detects panel via GPIO LCD_ID0/ID1 → "CSOT_HX83121"
-  - Loads Panel_csot_hx83121_vid.xml
+  - GetLcdId() → "CSOT_HX83121"
   - GPIO 38 reset → DSI init → DSC → panel lights up
-  - I2CPanelSendCommandSequence() sends I2C panel commands
 
-Phase 2: TouchPanelInit (GUID 8C88DA42-7CA9-...)
-  - GetVariable("TouchPanelInit", {24c38995-...}, attrs=0x3)
-  - If NOT_FOUND: SetVariable("TouchPanelInit", attrs=0x3, value=1)
-  - GetVariable("I2CWriteAndReadBUSY", same GUID, attrs=0x7)
-  - LocateProtocol(TLMM {ad9aec18-...})
-  - ConfigGpio(0x200FCAE0) → GPIO 174: func=15, pull-up, output
-  - 10ms Stall
-  - GpioOut(0x200E4AE0, 1) → GPIO 174 HIGH (DT02=1, I2C mode)
-  - ConfigGpio(0x200EC630) → GPIO 99: func=11, pull-up, output
-  - 10ms Stall
-  - GpioOut(0x200E4630, 1) → GPIO 99 HIGH (touch reset released)
-  → Boot ROM should load firmware here (status 0x04 → 0x05)
+Phase 2: TouchPanelInit
+  - GetVariable("TouchPanelInit", attrs=0x3)
+  - ConfigGpio(174) → output, pull-up
+  - GpioOut(174, 1) → HIGH (I2C mode)
+  - ConfigGpio(99) → output, pull-up
+  - GpioOut(99, 1) → HIGH (reset released)
+  → Boot ROM loads firmware (0x04 → 0x05)
 
-Phase 3: I2cTouchPanel (GUID 8C88DA42-...-CC5A)
-  - GetVariable("TouchPanelInit") reads handshake variable
-  - ConfigGpio(0x200FCAE0) → GPIO 174 config
-  - 10ms Stall
-  - GpioOut(0x200E4AE0, 0) → GPIO 174 LOW (DT02=0, switch to SPI mode)
-  - ReadHidDescriptor() → I2C-HID read at 0x4F
-  - ReadReportDescriptor() → HID report descriptor
-  - Installs TouchDeviceInitProtocol {e7f58a0e-...}
+Phase 3: I2cTouchPanel
+  - GpioOut(174, 0) → LOW (switch to SPI mode)
+  - ReadHidDescriptor() at 0x4F
+  - ReadReportDescriptor()
+  - Installs TouchDeviceInitProtocol
 ```
-
-### Qualcomm DALGpioSignalType Encoding
-
-The TLMM `ConfigGpio` parameter is a 32-bit packed value:
-
-| Bits | Field |
-|------|-------|
-| [13:4] | GPIO number |
-| [17:14] | Function select |
-| [19:18] | Pull configuration |
-| [21:20] | Direction |
-
-Values used by UEFI:
-
-| Config Value | GPIO | Func | Purpose |
-|-------------|------|------|---------|
-| 0x200FCAE0 | 174 | 15 | GPIO mode, pull-up, output |
-| 0x200E4AE0 | 174 | 9 | GPIO mode, pull-up, output drive |
-| 0x200EC630 | 99 | 11 | GPIO mode, pull-up, output |
-| 0x200E4630 | 99 | 9 | GPIO mode, pull-up, output drive |
-
-**Important**: UEFI uses `func=11` for GPIO 99, not the default `func=0`. Our previous GPIO 99 reset attempts used simple GPIO toggle without setting the correct TLMM function — this may be why Boot ROM didn't trigger.
 
 ### UEFI Variables
 
-| Variable | GUID | Attrs | Linux Visible | Value |
-|----------|------|-------|---------------|-------|
-| TouchPanelInit | {24c38995-...} | 0x3 (NV+BS) | **No** (no RT) | 1 |
-| I2CWriteAndReadBUSY | {24c38995-...} | 0x7 (NV+BS+RT) | Yes | 0x01 |
+| Variable | Attrs | Linux Visible | Purpose |
+|----------|-------|---------------|---------|
+| TouchPanelInit | 0x3 (NV+BS) | No (no RT) | DXE handshake |
+| I2CWriteAndReadBUSY | 0x7 (NV+BS+RT) | Yes | Touch busy flag |
 
-`TouchPanelInit` has attrs=0x3 (no RUNTIME_ACCESS), so it's invisible to Linux `efivars`. This is a handshake variable between TouchPanelInit and I2cTouchPanel DXE modules.
+## AHB Address Space Writability
 
-### Implications for Linux Boot ROM Fix
+| Address Region | Size | Read | Write | Purpose |
+|---|---|---|---|---|
+| 0x00000000 - 0x0003FFFF | 256KB | OK | **NO** | Flash/ROM read window |
+| 0x08000000 - 0x0801FFFF | 128KB | OK | **NO** | Code SRAM (HW protected) |
+| 0x10006000 - 0x10007FFF | 8KB | OK | YES | FW config/data registers |
+| 0x20000000 - 0x2001FFFF | 128KB | OK | YES | Data SRAM |
+| 0x80000000 - 0x80050xxx | varies | OK | YES | SPI200 / Flash / Reload controllers |
+| 0x90000000 - 0x900880FF | varies | OK | YES (partial) | IC core registers |
 
-The UEFI sequence reveals that:
-1. GPIO 174 must be set HIGH (I2C mode) **before** releasing GPIO 99 reset
-2. GPIO 99 needs specific TLMM function/pull configuration (func=11, pull-up)
-3. After Boot ROM loads, GPIO 174 is set LOW to switch back to SPI mode
-4. Our previous GPIO 99 resets used func=0 with no pull-up — wrong configuration
+## DPMS Power Management Warning
 
-### UEFI Sequence Reproduction — TESTED, FAILED (2026-02-12)
+DRM runtime power management can cause DPMS Off. When DSI link goes down, the TDDI IC becomes unreachable via I2C. The `keep-display-on.service` prevents this. Note: PMIC power rails (vreg_misc_3p3, vreg_s10b) stay up during DRM power-off — IC survives but becomes unresponsive until DSI is restored.
 
-Two comprehensive test scripts reproduced the UEFI sequence from Linux:
+## Firmware Analysis
 
-**v1** (`uefi_touch_init.py`) — GPIO 99 hardware reset (kills DSI):
-- Test A: GPIO 174 HIGH only → 0x04
-- Test B: func=0, pull-up, full sequence → 0x04
-- Test C: UEFI DAL func values (func=15/11) → 0x04
-- Test D: func=0, pull=keeper → 0x04
-- Test E: Baseline (no GPIO 174) → 0x04
+### Firmware Binary
+- **File**: `hx83121a_gaokun_fw.bin` (261,120 bytes / 0x3FC00)
+- **Header**: "HX83121-A", date 2022-09-27 19:30:56
+- **Variant**: CSOT panel (confirmed by flash byte-by-byte match)
 
-**v2** (`uefi_touch_init_v2.py`) — Software system reset (preserves DSI):
-- Test A: GPIO 174 HIGH + system reset → 0x04
-- Test B: GPIO 174 HIGH + reload engine → 0x04
-- Test C: Safe mode + reload + system reset → 0x04
-- Test D: EGoTouchRev sequence via system reset → 0x04
-- Test E: 3x system reset with long waits → 0x04
-- Test F: FW stop + reload + system reset → 0x04
+### Panel Variants (from himax_thp_drv.dll)
 
-**Additional finding from pinctrl-sc8280xp.c**: GPIO 99 only has functions 0 (gpio) and 1 (rgmii_1). GPIO 174 only has 0 (gpio) and 1 (qup4). The UEFI DAL "func=15/11" values are DAL-internal identifiers, not hardware FUNC_SEL values. UEFI's TLMM residual: GPIO 174 boots with FUNC_SEL=3 (probably 15 mod 4).
+The DLL embeds 3 firmware variants for different panel types, selected by OTP project ID:
+- BOE, CSOT New, **CSOT (our device)**
 
-**Conclusion**: Boot ROM failure is a **hardware-level issue**, not a software/configuration/GPIO problem. The UEFI sequence reproduction does not trigger Boot ROM. DSI clock preservation makes no difference.
+### Partition Table (flash offset 0x20030)
 
-## Next Steps (Priority Order, updated 2026-03-08)
+| # | SRAM Addr | Size | FW Offset | Type | Dest |
+|---|-----------|------|-----------|------|------|
+| 0 | 0x00000400 | 8,192 | 0x00000400 | Code | → 0x08000400 |
+| 1 | 0x00002400 | 109,056 | 0x00002400 | Code | → 0x08002400 |
+| 2 | 0x0001CE00 | 5,376 | 0x0001CE00 | Code | → 0x0801CE00 |
+| 3 | 0x0001E300 | 5,376 | 0x0001E300 | Code | → 0x0801E300 |
+| 4 | 0x0001F800 | 1,024 | 0x0001F800 | Code | → 0x0801F800 |
+| 5-9 | 0x10007xxx | varies | varies | Config | FW regs |
 
-### 1. Test Recovery After Windows Deletion (Highest Priority)
-The recovery service (`hx83121a-touch-recovery.service`) is deployed. Need to verify it works
-after completely deleting Windows from the NVMe. If Boot ROM still works from Linux GPIO reset
-in that state, the touchscreen problem is fully solved.
+## THP Architecture
 
-### 2. Identify UEFI TouchPanelInit Dependency
-If recovery fails after Windows deletion, need to identify what UEFI depends on:
-- Dump and compare EFI NVRAM variables before/after Windows deletion
-- Check if `Persisted_Capsules.bin` on ESP is relevant (currently 73MB, mostly empty)
-- Analyze `OemConfig` variable (440 bytes with non-zero data at offset 0xB0)
-- Test: delete only Windows partition (keep ESP intact) vs delete everything
+The HX83121A uses THP (Touchscreen Host Processing) — IC outputs raw capacitive data, host software computes coordinates. On Windows, requires `HuaweiThpService` daemon. On Linux in I2C-HID mode, the IC handles coordinate computation internally — no THP needed.
 
-### 3. Keep-Display-On Service
-`keep-display-on.service` prevents DRM power-off. Currently deployed but needs verification
-that it prevents long-term TDDI firmware loss. Note: DRM `power/control=auto` did NOT kill
-the IC in testing (PMIC rails stay up), but display blanking behavior may differ in GNOME.
-
-### 4. Community / Upstream
-- [linux-gaokun](https://github.com/right-0903/linux-gaokun) — MateBook E Go Linux support project
-- [awarson2233/EGoTouchRev-rebuild](https://github.com/awarson2233/EGoTouchRev-rebuild) — Windows ARM64 userspace touch driver
-- Contribute Boot ROM recovery findings to help the community
-
-## THP (Touchscreen Host Processing) Architecture
-
-Unlike traditional touchscreens where the IC computes coordinates internally, the HX83121A uses **THP** — the IC only outputs raw capacitive sensing data, and host-side software computes touch coordinates, gestures, and palm rejection.
-
-### Windows THP Software Stack (Gaokun_THP_Software_1.0.1.39.exe)
-
-```
-SpbThpTool.sys (ARM64 KMDF)     ← SPI kernel driver, ACPI\HIMX0001/HIMX0002
-  └── IOCTL interface
-SpiModule.x64.dll                ← Userspace SPI layer (DeviceIoControl)
-himax_thp_drv.dll (1.5MB)       ← Himax IC core driver
-  ├── 3 embedded FW variants (CSOT, CSOT New, BOE)
-  ├── hx_firmware_remapping()    ← OTP project ID → FW selection
-  ├── flashProgramming()         ← Flash programming via SPI200
-  └── hx_sense_on()              ← Start touch sensing
-TSACore.dll (1.7MB)              ← Touch Signal Algorithm (raw → coords)
-TSAPrmt.dll (5.0MB)              ← TSA parameters (per-panel tuning)
-ApDaemon.dll (1.5MB)             ← Main daemon orchestrator
-  ├── DriverThp                  ← Touch driver management
-  ├── ThpBase                    ← Base touch processing
-  └── VHF injection              ← HID reports to Windows
-HidInjectorThp.sys (ARM64 KMDF) ← VHF virtual HID driver
-THP_Service.dll                  ← Windows Service wrapper
-HuaweiThpService.exe (.NET)      ← Service entry point
-```
-
-**Stopping HuaweiThpService = touch stops working** (confirmed by forum users)
-
-### Linux I2C-HID — CONFIRMED WORKING! (2026-02-14)
-When IC firmware is running (status=0x05), the standard Linux I2C-HID stack works out of the box:
-- `i2c_hid_of` driver probes I2C address 0x4F → reads HID descriptor (30 bytes, 712-byte report descriptor)
-- `hid-multitouch` driver creates: Touchscreen (5 contacts, Protocol B) + Stylus input devices
-- 60Hz report rate, ABS_MT_POSITION_X/Y 0-4096, ABS_PRESSURE 0-255, 10 slots
-- **No custom THP driver needed!** The IC handles coordinate computation internally in I2C-HID mode
-
-**DPMS protection required**: `keep-display-on.service` must prevent display power-off, otherwise TDDI IC loses SRAM → firmware gone → touch permanently dead until next Windows boot
-
-## Firmware Loading — Direct SRAM Write (2026-02-14)
-
-### DLL Analysis (himax_thp_drv.dll)
-
-Reverse-engineered the Huawei THP driver DLL (`Gaokun_THP_Software_1.0.1.39.exe`, GEN3 variant). Key functions at RVAs:
-- `thp_afe_open_project` (0x206B0) — main init, up to 5 retry loops
-- `hx_firmware_remapping` (0x1EB00) — selects FW variant by OTP project ID
-- `flashCheckCRCRaw` (0x4860) — checks flash CRC via SPI200 HW CRC engine
-- Flash programming (0xF750) — SPI200 page program (WREN→erase→program per 256B page)
-- `hx_sense_on` (0x0A0F0) — GPIO reset + poll status
-
-**DLL firmware loading flow:**
-1. `hx_firmware_remapping()` → select correct FW variant (CSOT/BOE)
-2. `flashCheckCRCRaw()` → check flash CRC
-3. If CRC fails or version differs: `flashErase()` → `flashProgramming_real()` → verify CRC
-4. Write config to 0x10007550 and 0x1000753C
-5. `hx_sense_on(true)` → GPIO reset → wait for Boot ROM → poll status=0x05
-6. If status != 0x05 after retries → back to step 1 (re-flash)
-7. After 5 total failures → "firmware update over 5 times, open project failed!"
-
-**Critical finding: The DLL has NO direct Code SRAM write.** It relies entirely on Boot ROM.
-
-### Xiaomi Open-Source Driver — Direct SRAM Write!
-
-The [Xiaomi hxchipset kernel driver](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/tree/dagu-s-oss/drivers/input/touchscreen/hxchipset) contains a **full firmware download implementation** that writes directly to Code SRAM via AHB bus, bypassing Boot ROM entirely.
-
-**Complete firmware download sequence (from `himax_mcu_firmware_update_0f`):**
-
-| Step | Register / Action | Value | Purpose |
-|------|-------------------|-------|---------|
-| 1 | Write 0x90000018 | 0x55 | System reset |
-| 2 | Write 0x9000005C | 0xA5 | FW stop (if FW was running) |
-| 3 | Write I2C reg 0x31 | 0x27 | Safe mode password (lower) |
-| 4 | Write I2C reg 0x32 | 0x95 | Safe mode password (upper) |
-| 5 | Read 0x900000A8 | expect 0x0C | Verify safe mode |
-| 6 | **Write 0x80020020** | **0x00000000** | **Reset TCON** |
-| 7 | **Write 0x80020094** | **0x00 then 0x01** | **Reset ADC** |
-| 8 | Write 0x08000000+ | firmware data | **Write code to Code SRAM** |
-| 9 | HW CRC via 0x80050020/28 | | Verify SRAM contents |
-| 10 | Write 0x1000xxxx+ | config data | Write config to Data SRAM |
-| 11 | Write 0x10007F00 | 0x00000000 | Enable flash reload |
-| 12 | Write 0x90000098 | 0x53 | Leave safe mode → FW starts |
-
-**Steps 6-7 (TCON + ADC reset) are the crucial steps we were missing in all previous attempts!** These hardware controller resets likely lift the Code SRAM write protection that prevented our earlier write attempts (which always returned 0x78787878).
-
-For HX83121A specifically:
-- Max SRAM write chunk: 4096 bytes
-- Burst mode: INCR4 (reg 0x0D=0x13) with continuous (reg 0x13=0x31)
-- I2C AHB bridge: cmd 0x00 + addr(4B LE) + data(4B LE) per transaction
-
-### Firmware Loader Tool
-
-A Python script implementing this sequence is available at `tools/touchscreen/load_firmware_i2c.py`:
-
-```bash
-# On the tablet (as root):
-# 1. Unbind i2c_hid_of (script does this automatically)
-# 2. Load firmware
-python3 tools/touchscreen/load_firmware_i2c.py /path/to/hx83121a_gaokun_fw.bin
-# 3. Script rebinds i2c_hid_of → touchscreen appears
-```
-
-**Status: AWAITING TEST** — needs cold boot with IC in status 0x04 and working I2C AHB bridge.
-
-### Flash 0x40000 Area — Guest Info (Not Boot ROM Related)
-
-Flash offset 0x40000+ is the "Guest Info" area (Xiaomi driver: `HX_GUEST_INFO_FLASH_SADDR`). Contains factory manufacturing metadata (project ID, CG Color, BarCode, etc.). Structure: `[info_len(4)][info_id(4)][data...]` per 4KB page, up to 10 entries.
-
-Our value at 0x40004 = 0x00000100 is the `info_id` of an empty projectID entry. **This does NOT affect Boot ROM behavior** — all flash erase operations in both the DLL and open-source drivers preserve this area.
+## Companion Docs
+- `docs/TOUCHSCREEN_LIVE_TEST_2026-02-11.md` — 6 rounds of live testing
+- `docs/TOUCHSCREEN_READ_PLANE_DEBUG_2026-02-11.md` — SPI event plane debug
+- `docs/UEFI_FIRMWARE_TOUCH_ANALYSIS_2026-02-11.md` — UEFI capsule analysis
+- `docs/ACPI_TOUCH_DIFF_216_vs_217.md` — BIOS 2.16 vs 2.17 ACPI comparison
 
 ## References
 
-- [EGoTouchRev-rebuild](https://github.com/awarson2233/EGoTouchRev-rebuild) — Windows ARM64 userspace touch driver (no FW download capability)
-- [MiCode/Xiaomi_Kernel_OpenSource (dagu-s-oss)](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/tree/dagu-s-oss/drivers/input/touchscreen/hxchipset) — Himax hxchipset driver with **full firmware download** (direct SRAM write)
-- [yamikiri/hxchipset_240802](https://github.com/yamikiri/hxchipset_240802) — Updated Himax driver with similar SRAM write implementation
+- [EGoTouchRev-rebuild](https://github.com/awarson2233/EGoTouchRev-rebuild) — Windows ARM64 userspace touch driver
+- [MiCode/Xiaomi_Kernel_OpenSource (dagu-s-oss)](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/tree/dagu-s-oss/drivers/input/touchscreen/hxchipset) — Himax driver with SRAM write (not applicable to our IC)
 - [HimaxSoftware/hx_hid_util](https://github.com/HimaxSoftware/hx_hid_util) — Official Himax HID utility
-- `drivers/input/touchscreen/himax_hx83112b.c` — Kernel Himax I2C driver (no FW download)
+- [linux-gaokun](https://github.com/right-0903/linux-gaokun) — MateBook E Go Linux support project
