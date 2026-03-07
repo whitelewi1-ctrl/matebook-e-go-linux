@@ -1,8 +1,40 @@
 # Touchscreen Research Notes
 
-## Status: Linux Firmware Loader Ready for Testing!
+## Status: Boot ROM Recovery CONFIRMED Working!
 
-## Latest Update (2026-02-14)
+## Latest Update (2026-03-08)
+
+### Boot ROM Recovery from Linux — VERIFIED!
+
+Previous conclusion that "Boot ROM never works" was **WRONG** — it was tested only after Windows had been deleted, which changes UEFI behavior. With correct conditions, Boot ROM reliably loads firmware via GPIO 99 reset.
+
+**Key findings (2026-03-08):**
+
+1. **Boot ROM works reliably** — GPIO 99 hardware reset triggers Boot ROM to copy firmware from flash to Code SRAM. Status goes 0x04 → 0x05 within 0.5s.
+
+2. **Code SRAM 0x78787878 is normal** — This is hardware read-protection, NOT "empty" or "broken". Code SRAM returns 0x78787878 even when firmware IS running (status=0x05). This is by design.
+
+3. **Xiaomi SRAM direct-write does NOT work on our IC** — TCON+ADC reset (0x80020020/0x80020094) does not unlock Code SRAM write protection. These registers are unreadable. Our HX83121A silicon revision handles SRAM protection differently from Xiaomi's devices.
+
+4. **UEFI TouchPanelInit depends on Windows installation** — When Windows is completely deleted from the NVMe, UEFI's own touch initialization fails (even UEFI setup pages lose touch). The exact dependency is unknown (likely EFI NVRAM variables or ESP contents). Secure Boot is currently OFF, so it's not a Secure Boot issue.
+
+5. **Recovery service deployed** — `hx83121a-touch-recovery.service` automatically triggers Boot ROM via GPIO reset if touch is not detected at boot. Located at `/usr/local/bin/hx83121a-touch-recovery`.
+
+**Recovery sequence (UEFI-style):**
+```
+GPIO 174 HIGH (I2C mode) → 10ms wait →
+GPIO 99 LOW (50ms reset pulse) → GPIO 99 HIGH →
+Wait for status=0x05 (Boot ROM loads from flash, ~0.5s) →
+GPIO 174 LOW (SPI mode)
+```
+
+**Unresolved:** Will Boot ROM still work after Windows is deleted? Cannot be tested without actually deleting Windows. The recovery service is deployed as a safety net.
+
+### Previous: Direct SRAM Write Method (2026-02-14) — DOES NOT WORK
+
+~~Discovered direct SRAM write via Xiaomi hxchipset driver.~~ Tested on 2026-03-08: Code SRAM remains 0x78787878 after TCON+ADC reset. **This approach is invalid for our IC revision.**
+
+## Previous Update (2026-02-14)
 
 ### Direct SRAM Write Method Discovered!
 
@@ -272,8 +304,8 @@ Via SPI200 RDSR/JEDEC commands through I2C AHB bridge:
 - CRC registers (0x80050018) stay at 0xFFFFFFFF
 - Pre-configuring reload_addr_from/cmd_beat has no effect
 
-### Conclusion
-The Boot ROM requires an **external trigger from UEFI/XBL** during the display initialization phase. On Detach0-0's working system, IC status is already 0x05 before any Windows driver runs. This trigger cannot be replicated from Linux userspace via I2C, SPI, or GPIO.
+### Conclusion (UPDATED 2026-03-08)
+~~Boot ROM cannot be triggered from Linux.~~ **CORRECTED:** Boot ROM CAN be triggered from Linux via GPIO 99 hardware reset. Previous failures were in a post-Windows-deletion state where UEFI hadn't initialized the IC environment. Recovery tool: `tools/touchscreen/hx83121a-touch-recovery`
 
 ## Firmware Analysis
 
@@ -342,26 +374,32 @@ Format: 16-byte entries: `[sram_addr(4)][size(4)][fw_offset(4)][flags(4)]`
 - **Uses SPI** via SPBTESTTOOL.sys driver (IOCTLs for SPI full-duplex + GPIO control)
 - **Dual device**: master (THPA/SPI6) + slave (THPB/SPI20)
 
-### Root Cause Hypothesis (Updated 2026-02-12)
+### Root Cause Hypothesis (Updated 2026-03-08)
 
-**All software trigger methods exhausted.** The UEFI TouchPanelInit sequence was fully reverse-engineered and reproduced from Linux — Boot ROM still doesn't load. This confirms the issue is **hardware-level**, not a missing software trigger.
+**CORRECTED: Boot ROM DOES work on this device.** Previous conclusion was wrong because all testing was done after Windows had been deleted from the NVMe, which changes UEFI's initialization behavior.
 
-**Completely ruled out** (12 tests in v1+v2 scripts, plus 10+ previous attempts):
-- Flash content, protection, CRC
-- GPIO 99 reset (hardware and software, with all TLMM configurations)
-- GPIO 174 I2C/SPI mode flag
-- TLMM function select, pull, drive strength
-- DSI clock dependency
-- Reload engine, activ_relod
-- Safe mode, FW stop, system reset
-- Panel driver GPIO38 interference
-- ACPI _STA conditions
-- Firmware variant mismatch
+**Confirmed (2026-03-08):**
+- Boot ROM reliably loads firmware after GPIO 99 reset (tested 5+ times)
+- Recovery from status=0x04 to 0x05 takes ~0.5s
+- `reload_done = 0x72C0` confirms proper Boot ROM completion
+- Touch fully functional after recovery (i2c_hid_of + hid-multitouch)
 
-**Current hypothesis**: Hardware difference between our IC and Detach0-0's working device:
-1. **OTP configuration** — IC's One-Time Programmable fuses may disable auto-boot or require different trigger
-2. **Silicon revision** — Different Boot ROM mask ROM version
-3. **Board-level difference** — Missing pull-up, disconnected signal, or power supply issue
+**Current root cause:** UEFI's `TouchPanelInit` DXE module depends on something related to the Windows installation on the NVMe. When Windows is completely deleted:
+- UEFI setup pages lose touch capability
+- Boot ROM is never triggered during UEFI boot
+- IC stays at status=0x04
+
+Possible dependencies (not yet verified):
+1. **EFI NVRAM variables** — `TouchPanelInit` (attrs=0x3, NV+BS, invisible to Linux) or `I2CWriteAndReadBUSY` (value=0x01)
+2. **ESP contents** — Windows Boot Manager presence may affect UEFI DXE dispatch
+3. **OemConfig variable** — 440-byte config blob with unknown fields at offset 0xB0-0xD0
+4. **Boot flow path** — UEFI may skip TouchPanelInit when no Windows boot target exists
+
+**NOT the cause:**
+- Secure Boot (currently disabled, touch works)
+- Hardware defect (Boot ROM proven functional)
+- Flash content (verified correct)
+- Silicon revision (Boot ROM works fine)
 
 ## ACPI DSDT Analysis (2026-02-11)
 
@@ -501,32 +539,29 @@ Two comprehensive test scripts reproduced the UEFI sequence from Linux:
 
 **Conclusion**: Boot ROM failure is a **hardware-level issue**, not a software/configuration/GPIO problem. The UEFI sequence reproduction does not trigger Boot ROM. DSI clock preservation makes no difference.
 
-## Next Steps (Priority Order, updated 2026-02-14)
+## Next Steps (Priority Order, updated 2026-03-08)
 
-### 1. Reverse-Engineer DLL Firmware Loading (Highest Priority)
-`himax_thp_drv.dll` handles status=0x04 → loads firmware. The DLL embeds 3 FW variants and uses
-SPI200 flash programming. Need to reverse-engineer the exact loading path using Ghidra/IDA,
-specifically the code path when `hx_sense_on()` encounters status=0x04 after 5 GPIO resets.
-The DLL likely has a firmware download function we haven't found yet.
+### 1. Test Recovery After Windows Deletion (Highest Priority)
+The recovery service (`hx83121a-touch-recovery.service`) is deployed. Need to verify it works
+after completely deleting Windows from the NVMe. If Boot ROM still works from Linux GPIO reset
+in that state, the touchscreen problem is fully solved.
 
-### 2. Windows SPI Traffic Capture
-Use Bus Hound / IRPMon to capture SPI traffic during Windows THP driver startup.
-This would reveal the exact SPI commands used to load firmware.
+### 2. Identify UEFI TouchPanelInit Dependency
+If recovery fails after Windows deletion, need to identify what UEFI depends on:
+- Dump and compare EFI NVRAM variables before/after Windows deletion
+- Check if `Persisted_Capsules.bin` on ESP is relevant (currently 73MB, mostly empty)
+- Analyze `OemConfig` variable (440 bytes with non-zero data at offset 0xB0)
+- Test: delete only Windows partition (keep ESP intact) vs delete everything
 
-### 3. Implement Linux Firmware Loader
-Once the loading protocol is understood, implement it as a Linux driver or userspace tool:
-- SPI communication via spidev0.0
-- Firmware binary: `/lib/firmware/himax/hx83121a_gaokun_fw.bin` (261,120 bytes)
-- After loading: IC goes to status=0x05, i2c_hid_of automatically picks up the touchscreen
+### 3. Keep-Display-On Service
+`keep-display-on.service` prevents DRM power-off. Currently deployed but needs verification
+that it prevents long-term TDDI firmware loss. Note: DRM `power/control=auto` did NOT kill
+the IC in testing (PMIC rails stay up), but display blanking behavior may differ in GNOME.
 
-### 4. Verify Touch Persistence with keep-display-on
-Boot Windows → firmware loads → warm reboot to Linux → verify touch works with
-`keep-display-on.service` active → test extended operation (hours).
-
-### 5. Community / Upstream
+### 4. Community / Upstream
 - [linux-gaokun](https://github.com/right-0903/linux-gaokun) — MateBook E Go Linux support project
 - [awarson2233/EGoTouchRev-rebuild](https://github.com/awarson2233/EGoTouchRev-rebuild) — Windows ARM64 userspace touch driver
-- Contribute findings to help the community
+- Contribute Boot ROM recovery findings to help the community
 
 ## THP (Touchscreen Host Processing) Architecture
 
