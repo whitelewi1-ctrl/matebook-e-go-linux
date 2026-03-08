@@ -222,17 +222,29 @@ The panel supports 120 Hz via DSC mode (init register E2=0x00). The driver inclu
 - 120 Hz: native vtotal (2736)
 - 60 Hz: doubled vtotal (5472), same link speed
 
+## Battery and EC
+
+The Huawei EC driver (`huawei-gaokun-ec`) and battery driver (`huawei-gaokun-battery`) provide battery status, charging control, and smart charge support. These are built as modules from the kernel source tree (requires `CONFIG_EC_HUAWEI_GAOKUN=m` and `CONFIG_BATTERY_HUAWEI_GAOKUN=m`).
+
+## USB-C (UCSI)
+
+The UCSI driver (`ucsi_huawei_gaokun`) enables USB Type-C functionality including power delivery negotiation. Requires the EC driver. Build with `CONFIG_UCSI_HUAWEI_GAOKUN=m`.
+
 ## Current status
 
 - Display: working (1600x2560 @ 60/120 Hz, hardware-accelerated via MSM DRM)
+- GPU: working (Adreno 690, OpenGL 4.6 + Vulkan 1.3 via freedreno/turnip)
 - Backlight: working (DSI-controlled, direct dual-link writes)
 - Touchscreen: working (TDDI recovery service, 1 MHz I2C)
 - Audio: working (WCD938x + WSA8835 via SoundWire + UCM patch)
+- Battery: working (huawei-gaokun-ec + huawei-gaokun-battery)
+- USB-C: working (UCSI via huawei-gaokun-ec)
 - fbcon: working (with `fbcon=rotate:1` for portrait panel)
 - Keyboard cover: working (keyboard + touchpad with usbhid quirk + activation service)
 - Bluetooth: working (WCN6855 / btqca, with NVM patch + kernel patch)
 - WiFi: working (WCN6855 / ath11k_pci)
-- GPU acceleration (Adreno): untested beyond basic modesetting
+- Camera: not supported (no upstream driver)
+- Suspend: s2idle configured, untested
 
 ## Acknowledgements
 
