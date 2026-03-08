@@ -8,9 +8,11 @@ Native GPU-accelerated display driver for the Huawei MateBook E Go, the first wo
 |-----------|---------|
 | Device | Huawei MateBook E Go (GK-W7X) |
 | SoC | Qualcomm Snapdragon 8cx Gen 3 (sc8280xp) |
-| Panel | Himax HX83121A, 12.35" 1600x2560 @ 60 Hz |
+| Panel | Himax HX83121A, 12.35" 1600x2560 @ 60/120 Hz |
 | Display link | Dual DSI with DSC 1.1 (8 bpp, slice 800x20) |
 | Backlight | DSI register 0x51 |
+| Touchscreen | Himax HX83121A TDDI, I2C 0x48/0x4F, SPI6 |
+| Audio | WCD938x codec + WSA8835 v2 speakers (SoundWire) |
 
 ## What's included
 
@@ -18,6 +20,7 @@ Native GPU-accelerated display driver for the Huawei MateBook E Go, the first wo
 - **Kernel patches** (`kernel-patches/`) -- 6 patches against Linux 6.18.8 fixing clock, DPU, bridge, Bluetooth, and EC suspend bugs
 - **Device tree** (`device-tree/`) -- DTS source and pre-built DTB for the MateBook E Go
 - **Boot configs** (`boot/`) -- reference GRUB and mkinitcpio configurations
+- **Touchscreen recovery** (`tools/touchscreen/`) -- systemd service that restores touch after panel init resets the TDDI shared GPIO
 - **Touchpad activation** (`tools/touchpad/`) -- systemd service + script for keyboard cover touchpad
 - **Bluetooth fix** (`tools/bluetooth/`) -- NVM firmware patcher for WCN6855 BD address
 - **Diagnostic tool** (`tools/`) -- userspace tool to read DPU/DSC/INTF/DSI hardware registers
@@ -38,7 +41,7 @@ Getting this panel working required fixing 7 bugs across 5 kernel subsystems. Th
 
 6. **Panel driver: dual-link init** -- The HX83121A requires the full init sequence (vendor commands + sleep out + PPS + compression + display_on) to be sent on *both* DSI links.
 
-7. **Panel driver: dual-link brightness tearing** -- Setting brightness via DCS 0x51 on two DSI links sequentially creates a time gap where left and right halves display different brightness, causing a visible seam. The fix uses software brightness ramping: instead of jumping directly to the target, the driver steps by 64/4095 (~1.6%) every 16 ms via a delayed workqueue. The small per-step change makes the dual-link timing gap imperceptible.
+7. **Panel driver: dual-link brightness** -- Setting brightness via DCS 0x51 on two DSI links sequentially can cause a brief right-half flash. Direct writes are used (no ramping) as the flash is only visible during rapid continuous adjustment.
 
 ## Quick start
 
@@ -161,15 +164,74 @@ pci-pwrctrl-pwrseq
 ath11k_pci
 ```
 
+## Touchscreen
+
+The HX83121A is a TDDI (Touch and Display Driver Integration) IC -- it shares GPIO 99 (reset) with the display. The panel init sequence resets this GPIO, killing the touch firmware. The UEFI `TouchPanelInit` only runs on Windows boot paths, so Linux boots without touch.
+
+The recovery service (`tools/touchscreen/`) uses a two-round I2C rebind sequence to restore touch after every boot (~7s):
+
+1. Set GPIO 174 HIGH (I2C mode), reset GPIO 99, wait for Boot ROM
+2. Bind `i2c_hid` (fails, but wakes the HID interface at 0x4F)
+3. Set GPIO 174 LOW (OE=1), rebind `i2c_hid` (succeeds)
+
+```bash
+cp tools/touchscreen/hx83121a-touch-recovery /usr/local/bin/
+cp tools/touchscreen/hx83121a-touch-recovery.service /etc/systemd/system/
+chmod +x /usr/local/bin/hx83121a-touch-recovery
+systemctl daemon-reload
+systemctl enable hx83121a-touch-recovery.service
+```
+
+I2C touch speed can be increased to 1 MHz (from 400 kHz default) by patching the DTB:
+
+```bash
+fdtput -t i device-tree/sc8280xp-huawei-gaokun3.dtb /soc@0/geniqup@9c0000/i2c@990000 clock-frequency 1000000
+```
+
+## Audio
+
+Audio uses the Qualcomm AudioReach stack: ADSP firmware → SoundWire → WCD938x (headphones) + WSA8835 (speakers).
+
+The stock ALSA UCM configuration only recognizes the Lenovo X13s. To enable audio on the MateBook E Go, patch the UCM config to match the Huawei DMI:
+
+```bash
+# /usr/share/alsa/ucm2/conf.d/sc8280xp/sc8280xp.conf
+# Add a HUAWEI match block that reuses the X13s profile (same codec hardware)
+```
+
+See `tools/audio/sc8280xp.conf` for the patched UCM configuration.
+
+Required firmware (from Huawei Windows partition or backup):
+- `/lib/firmware/qcom/sc8280xp/HUAWEI/gaokun3/qcadsp8280.mbn`
+- `/lib/firmware/qcom/sc8280xp/SC8280XP-HUAWEI-MATEBOOKEGO-tplg.bin` → symlink to `HUAWEI/gaokun3/audioreach-tplg.bin`
+
+Module loading config:
+```bash
+# /etc/modules-load.d/audio.conf
+lpasscc_sc8280xp
+snd-soc-sc8280xp
+
+# /etc/modprobe.d/audio-deps.conf
+softdep pinctrl_sc8280xp_lpass_lpi pre: lpasscc_sc8280xp
+```
+
+## 120 Hz display
+
+The panel supports 120 Hz via DSC mode (init register E2=0x00). The driver includes both 60 Hz and 120 Hz modes, selectable in GNOME Settings → Displays.
+
+- 120 Hz: native vtotal (2736)
+- 60 Hz: doubled vtotal (5472), same link speed
+
 ## Current status
 
-- Display: working (1600x2560 @ 60 Hz, hardware-accelerated via MSM DRM)
-- Backlight: working (DSI-controlled, software-ramped dual-link for tear-free adjustment)
+- Display: working (1600x2560 @ 60/120 Hz, hardware-accelerated via MSM DRM)
+- Backlight: working (DSI-controlled, direct dual-link writes)
+- Touchscreen: working (TDDI recovery service, 1 MHz I2C)
+- Audio: working (WCD938x + WSA8835 via SoundWire + UCM patch)
 - fbcon: working (with `fbcon=rotate:1` for portrait panel)
 - Keyboard cover: working (keyboard + touchpad with usbhid quirk + activation service)
 - Bluetooth: working (WCN6855 / btqca, with NVM patch + kernel patch)
 - WiFi: working (WCN6855 / ath11k_pci)
-- Touchscreen: not working (SPI+I2C communication OK, flash programmed, but code SRAM hardware write-protected and boot ROM not loading; see [docs/TOUCHSCREEN.md](docs/TOUCHSCREEN.md))
 - GPU acceleration (Adreno): untested beyond basic modesetting
 
 ## Acknowledgements

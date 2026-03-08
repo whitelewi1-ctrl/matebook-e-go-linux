@@ -8,6 +8,8 @@
 #include <linux/backlight.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
+#include <linux/i2c.h>
+#include <linux/io.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/workqueue.h>
@@ -41,16 +43,14 @@ struct panel_info {
 	struct mipi_dsi_device *dsi[2];
 	const struct panel_desc *desc;
 	struct drm_dsc_config dsc;
-	// enum drm_panel_orientation orientation;
+	enum drm_panel_orientation orientation;
 	struct gpio_desc *reset_gpio;
 	struct backlight_device *backlight;
 	struct regulator *vddio;
 
-	/* Brightness ramping: gradually step to target to avoid visible
-	 * left/right seam on dual-DSI (two sequential commands per step). */
-	struct delayed_work bl_work;
-	u16 bl_target;
-	u16 bl_current;
+	/* Touch recovery: TDDI shares reset with display, so panel driver
+	 * must restore touch after init sequence resets GPIO 99. */
+	struct work_struct touch_work;
 };
 
 struct panel_desc {
@@ -219,6 +219,19 @@ static int gaokun_csot_init_sequence(struct panel_info *pinfo)
 static const struct drm_display_mode gaokun_csot_modes[] = {
 #ifdef XBL
 	{
+		/* 120Hz: E2=0x00 configures IC for 120Hz+DSC */
+		.clock = (1600 + 60 + 40 + 60) * (2560 + 154 + 4 + 18) * 120 / 1000,
+		.hdisplay = 1600,
+		.hsync_start = 1600 + 60,
+		.hsync_end = 1600 + 60 + 40,
+		.htotal = 1600 + 60 + 40 + 60,
+		.vdisplay = 2560,
+		.vsync_start = 2560 + 154,
+		.vsync_end = 2560 + 154 + 4,
+		.vtotal = 2560 + 154 + 4 + 18,
+	},
+	{
+		/* 60Hz: same link speed, doubled vtotal */
 		.clock = (1600 + 60 + 40 + 60) * (2560 + 2890 + 4 + 18) * 60 / 1000,
 		.hdisplay = 1600,
 		.hsync_start = 1600 + 60,
@@ -277,6 +290,8 @@ static const struct panel_desc gaokun_csot_desc = {
 	.has_dcs_backlight = true,
 };
 
+static void hx83121a_bl_send(struct panel_info *pinfo, u16 brightness);
+
 static void hx83121a_reset(struct panel_info *pinfo)
 {
 	if (!pinfo->reset_gpio)
@@ -291,6 +306,135 @@ static void hx83121a_reset(struct panel_info *pinfo)
 	gpiod_set_value_cansleep(pinfo->reset_gpio, 0); // high
 
 	msleep(110);
+}
+
+/*
+ * Touch recovery for HX83121A TDDI.
+ *
+ * The panel init resets GPIO 99 which kills touch firmware (shared TDDI reset).
+ * Boot ROM reloads firmware from flash in ~0.1s, but the HID interface at
+ * I2C 0x4F requires a specific wake sequence:
+ *
+ * 1. Set GPIO 174 HIGH (I2C mode select), wait for Boot ROM (status=0x05)
+ * 2. Attempt I2C transaction to 0x4F (NACKs but wakes HID interface)
+ * 3. Release + rebind i2c_hid driver
+ * 4. Set GPIO 174 LOW (keep OE=1) — 0x4F now responds
+ * 5. Release + rebind i2c_hid driver — touch input appears
+ */
+#define TLMM_BASE		0x0F100000
+#define GPIO174_CFG		(TLMM_BASE + 174 * 0x1000)
+#define GPIO174_IO		(GPIO174_CFG + 4)
+#define AHB_I2C_BUS		4
+#define AHB_ADDR		0x48
+#define HID_ADDR		0x4F
+#define AHB_STATUS_REG		0x900000A8
+#define STATUS_FW_RUNNING	0x05
+
+static int hx83121a_ahb_read32(struct i2c_adapter *adap, u32 addr, u32 *val)
+{
+	u8 wbuf_addr[5] = { 0x00,
+		(addr >>  0) & 0xFF, (addr >>  8) & 0xFF,
+		(addr >> 16) & 0xFF, (addr >> 24) & 0xFF };
+	u8 wbuf_dir[2] = { 0x0C, 0x00 };
+	u8 wbuf_rd[1] = { 0x08 };
+	u8 rbuf[4];
+	struct i2c_msg msgs[4] = {
+		{ .addr = AHB_ADDR, .flags = 0, .len = 5, .buf = wbuf_addr },
+		{ .addr = AHB_ADDR, .flags = 0, .len = 2, .buf = wbuf_dir },
+		{ .addr = AHB_ADDR, .flags = 0, .len = 1, .buf = wbuf_rd },
+		{ .addr = AHB_ADDR, .flags = I2C_M_RD, .len = 4, .buf = rbuf },
+	};
+	int ret;
+
+	ret = i2c_transfer(adap, &msgs[0], 1);
+	if (ret < 0) return ret;
+	ret = i2c_transfer(adap, &msgs[1], 1);
+	if (ret < 0) return ret;
+	ret = i2c_transfer(adap, &msgs[2], 2);
+	if (ret < 0) return ret;
+
+	*val = rbuf[0] | (rbuf[1] << 8) | (rbuf[2] << 16) | (rbuf[3] << 24);
+	return 0;
+}
+
+static void hx83121a_touch_recovery_work(struct work_struct *work)
+{
+	struct panel_info *pinfo = container_of(work, struct panel_info,
+						touch_work);
+	struct device *dev = &pinfo->dsi[0]->dev;
+	struct i2c_adapter *adap;
+	struct device *hid_dev;
+	void __iomem *gpio174;
+	u32 cfg_orig, status;
+	int i, ret;
+
+	gpio174 = ioremap(GPIO174_CFG, 8);
+	if (!gpio174) {
+		dev_err(dev, "touch: failed to map GPIO 174\n");
+		return;
+	}
+
+	adap = i2c_get_adapter(AHB_I2C_BUS);
+	if (!adap) {
+		dev_err(dev, "touch: failed to get I2C adapter %d\n",
+			AHB_I2C_BUS);
+		iounmap(gpio174);
+		return;
+	}
+
+	cfg_orig = readl(gpio174);
+
+	/* === Round 1: GPIO 174 HIGH + wait Boot ROM + wake HID === */
+
+	/* Set GPIO 174 output HIGH (OE=1, OUT=1) */
+	writel(cfg_orig | (1 << 9), gpio174);
+	writel(0x02, gpio174 + 4);
+	usleep_range(10000, 11000);
+
+	/* Wait for Boot ROM to load firmware (status 0x04 → 0x05) */
+	for (i = 0; i < 50; i++) {
+		msleep(100);
+		if (hx83121a_ahb_read32(adap, AHB_STATUS_REG, &status) == 0 &&
+		    status == STATUS_FW_RUNNING) {
+			dev_info(dev, "touch: Boot ROM done in %d ms\n",
+				 (i + 1) * 100);
+			break;
+		}
+	}
+	if (status != STATUS_FW_RUNNING) {
+		dev_warn(dev, "touch: Boot ROM timeout (status=0x%02x)\n",
+			 status);
+		goto out;
+	}
+
+	/* Unbind i2c_hid_of, bind with 174 HIGH (wakes HID interface) */
+	hid_dev = bus_find_device_by_name(&i2c_bus_type, NULL, "4-004f");
+	if (hid_dev) {
+		device_release_driver(hid_dev);
+		msleep(100);
+		ret = device_attach(hid_dev);
+		dev_dbg(dev, "touch: round 1 bind: %d\n", ret);
+		msleep(1000);
+
+		/* === Round 2: GPIO 174 LOW + rebind === */
+		device_release_driver(hid_dev);
+		msleep(100);
+
+		/* Set GPIO 174 LOW (keep OE=1) */
+		writel(0x00, gpio174 + 4);
+		msleep(500);
+
+		ret = device_attach(hid_dev);
+		put_device(hid_dev);
+		dev_info(dev, "touch: recovery complete (bind=%d)\n", ret);
+	} else {
+		dev_warn(dev, "touch: HID device 4-004f not found\n");
+		writel(0x00, gpio174 + 4);
+	}
+
+out:
+	i2c_put_adapter(adap);
+	iounmap(gpio174);
 }
 
 static int hx83121a_prepare(struct drm_panel *panel)
@@ -358,14 +502,12 @@ static int hx83121a_prepare(struct drm_panel *panel)
 
 	msleep(120);
 
-#ifdef XBL
 	/* Set initial brightness on both links */
-	for (i = 0; i < 2; i++) {
-		if (!pinfo->dsi[i])
-			continue;
-		mipi_dsi_dcs_set_display_brightness(pinfo->dsi[i], 0xff04);
-	}
-#endif
+	hx83121a_bl_send(pinfo, 512);
+
+	/* Schedule async touch recovery — panel reset killed touch firmware
+	 * via shared TDDI GPIO 99, Boot ROM will reload it. */
+	schedule_work(&pinfo->touch_work);
 
 	return 0;
 }
@@ -403,7 +545,7 @@ static void hx83121a_remove(struct mipi_dsi_device *dsi)
 	struct panel_info *pinfo = mipi_dsi_get_drvdata(dsi);
 	int ret;
 
-	cancel_delayed_work_sync(&pinfo->bl_work);
+	cancel_work_sync(&pinfo->touch_work);
 
 	ret = mipi_dsi_detach(pinfo->dsi[0]);
 	if (ret < 0)
@@ -450,30 +592,25 @@ static int hx83121a_get_modes(struct drm_panel *panel,
 	connector->display_info.height_mm = pinfo->desc->height_mm;
 	connector->display_info.bpc = pinfo->desc->bpc;
 
+	drm_connector_set_panel_orientation(connector, pinfo->orientation);
+
 	return pinfo->desc->num_modes;
 }
 
-// static enum drm_panel_orientation hx83121a_get_orientation(struct drm_panel *panel)
-// {
-// 	struct panel_info *pinfo = to_panel_info(panel);
-//
-// 	return pinfo->orientation;
-// }
+static enum drm_panel_orientation hx83121a_get_orientation(struct drm_panel *panel)
+{
+	struct panel_info *pinfo = to_panel_info(panel);
+
+	return pinfo->orientation;
+}
 
 static const struct drm_panel_funcs hx83121a_panel_funcs = {
 	.disable = hx83121a_disable,
 	.prepare = hx83121a_prepare,
 	.unprepare = hx83121a_unprepare,
 	.get_modes = hx83121a_get_modes,
-	// .get_orientation = hx83121a_get_orientation,
+	.get_orientation = hx83121a_get_orientation,
 };
-
-/* Brightness ramping parameters.
- * Step size controls the max brightness change per tick. Smaller = smoother
- * but slower. 64 out of 4095 ≈ 1.6% per tick, invisible to the eye.
- * Interval controls tick rate. 16ms ≈ 60fps animation. */
-#define BL_RAMP_STEP	64
-#define BL_RAMP_MS	16
 
 static void hx83121a_bl_send(struct panel_info *pinfo, u16 brightness)
 {
@@ -487,45 +624,12 @@ static void hx83121a_bl_send(struct panel_info *pinfo, u16 brightness)
 	}
 }
 
-static void hx83121a_bl_work(struct work_struct *work)
-{
-	struct panel_info *pinfo = container_of(work, struct panel_info,
-						bl_work.work);
-	u16 target = pinfo->bl_target;
-	u16 cur = pinfo->bl_current;
-	s32 diff = (s32)target - (s32)cur;
-
-	/* First update after probe — jump directly, don't ramp from zero */
-	if (cur == 0 && target > 0) {
-		cur = target;
-	} else if (diff > BL_RAMP_STEP) {
-		cur += BL_RAMP_STEP;
-	} else if (diff < -BL_RAMP_STEP) {
-		cur -= BL_RAMP_STEP;
-	} else {
-		cur = target;
-	}
-
-	pinfo->bl_current = cur;
-	hx83121a_bl_send(pinfo, cur);
-
-	/* Keep ramping if not at target yet */
-	if (cur != pinfo->bl_target)
-		schedule_delayed_work(&pinfo->bl_work,
-				     msecs_to_jiffies(BL_RAMP_MS));
-}
-
 static int hx83121a_bl_update_status(struct backlight_device *bl)
 {
 	struct panel_info *pinfo = bl_get_data(bl);
 	u16 brightness = backlight_get_brightness(bl);
 
-	pinfo->bl_target = brightness;
-
-	/* Kick the ramp if not already running */
-	if (!delayed_work_pending(&pinfo->bl_work))
-		schedule_delayed_work(&pinfo->bl_work,
-				     msecs_to_jiffies(BL_RAMP_MS));
+	hx83121a_bl_send(pinfo, brightness);
 	return 0;
 }
 
@@ -640,15 +744,11 @@ static int hx83121a_probe(struct mipi_dsi_device *dsi)
 
 	drm_panel_init(&pinfo->panel, dev, &hx83121a_panel_funcs, DRM_MODE_CONNECTOR_DSI);
 
-	// ret = of_drm_get_panel_orientation(dev->of_node, &pinfo->orientation);
-	// if (ret < 0) {
-	// 	dev_err(dev, "%pOF: failed to get orientation %d\n", dev->of_node, ret);
-	// 	return ret;
-	// }
+	pinfo->orientation = DRM_MODE_PANEL_ORIENTATION_RIGHT_UP;
 
 	pinfo->panel.prepare_prev_first = true;
 
-	INIT_DELAYED_WORK(&pinfo->bl_work, hx83121a_bl_work);
+	INIT_WORK(&pinfo->touch_work, hx83121a_touch_recovery_work);
 
 	if (pinfo->desc->has_dcs_backlight) {
 		pinfo->panel.backlight = hx83121a_create_backlight(dsi, pinfo);
