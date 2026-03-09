@@ -230,21 +230,72 @@ The Huawei EC driver (`huawei-gaokun-ec`) and battery driver (`huawei-gaokun-bat
 
 The UCSI driver (`ucsi_huawei_gaokun`) enables USB Type-C functionality including power delivery negotiation. Requires the EC driver. Build with `CONFIG_UCSI_HUAWEI_GAOKUN=m`.
 
+## Waydroid (Android in Linux)
+
+Waydroid runs Android apps in an LXC container on Wayland. The custom kernel includes nftables modules required for container networking.
+
+### Kernel requirements
+
+The following must be enabled (built-in or module):
+
+```
+CONFIG_NF_TABLES=y
+CONFIG_NF_TABLES_INET=y
+CONFIG_NFT_NAT=y
+CONFIG_NFT_MASQ=y
+CONFIG_NFT_CT=y
+CONFIG_NFT_REJECT=m
+CONFIG_NETFILTER_XT_TARGET_CHECKSUM=y
+```
+
+**Note:** `CONFIG_IP_MULTIPLE_TABLES` (policy routing) causes system freeze when waydroid GUI launches on this platform. Do not enable it.
+
+### Network fix
+
+Android's IpClient does not receive the default gateway via DHCP in the LXC veth environment. A systemd service automatically adds the route:
+
+```bash
+cp tools/waydroid/waydroid-net-fix.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable waydroid-net-fix.service
+```
+
+### Play Protect certification
+
+The system image ships with `ro.build.tags=test-keys` which fails Play Protect. Fix via overlay:
+
+```bash
+# Create overlay build.prop with release-keys
+mkdir -p /var/lib/waydroid/overlay/system
+cp /var/lib/waydroid/rootfs/system/build.prop /var/lib/waydroid/overlay/system/build.prop
+sed -i 's/test-keys/release-keys/g; s/userdebug/user/g' /var/lib/waydroid/overlay/system/build.prop
+```
+
+Then register the device at https://www.google.com/android/uncertified/ with the android_id from:
+
+```bash
+sudo waydroid shell -- sqlite3 /data/data/com.google.android.gsf/databases/gservices.db \
+  "select * from main where name = 'android_id';"
+```
+
 ## Current status
 
 - Display: working (1600x2560 @ 60/120 Hz, hardware-accelerated via MSM DRM)
 - GPU: working (Adreno 690, OpenGL 4.6 + Vulkan 1.3 via freedreno/turnip)
+- Video decode: Venus hardware codec enabled (CONFIG_VIDEO_QCOM_VENUS)
 - Backlight: working (DSI-controlled, direct dual-link writes)
 - Touchscreen: working (TDDI recovery service, 1 MHz I2C)
 - Audio: working (WCD938x + WSA8835 via SoundWire + UCM patch)
 - Battery: working (huawei-gaokun-ec + huawei-gaokun-battery)
 - USB-C: working (UCSI via huawei-gaokun-ec)
 - fbcon: working (with `fbcon=rotate:1` for portrait panel)
-- Keyboard cover: working (keyboard + touchpad with usbhid quirk + activation service)
+- Keyboard cover: working (keyboard + touchpad with usbhid quirk + activation service + udev auto-recovery)
 - Bluetooth: working (WCN6855 / btqca, with NVM patch + kernel patch)
 - WiFi: working (WCN6855 / ath11k_pci)
+- Waydroid: working (with network fix service, Play Store certified)
 - Camera: not supported (no upstream driver)
-- Suspend: s2idle configured, untested
+- Sensors: not supported (SLPI DSP, no Linux driver)
+- Suspend: s2idle works, minor resume glitches
 
 ## Acknowledgements
 

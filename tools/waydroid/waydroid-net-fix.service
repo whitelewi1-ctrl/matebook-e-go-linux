@@ -1,0 +1,15 @@
+[Unit]
+Description=Fix waydroid default gateway
+After=waydroid-container.service
+Requires=waydroid-container.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 15
+ExecStart=/usr/bin/waydroid shell -- ip route add default via 192.168.240.1
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
