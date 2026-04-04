@@ -168,6 +168,7 @@
 		enable-active-high;
 
 		regulator-boot-on;
+		regulator-always-on;
 	};
 
 	vreg_avee_5p5: regulator-avee-5p5 {
@@ -181,6 +182,7 @@
 		enable-active-high;
 
 		regulator-boot-on;
+		regulator-always-on;
 	};
 
 	vreg_dsi_bl: regulator-dsi-bl {
@@ -192,6 +194,7 @@
 		enable-active-high;
 
 		regulator-boot-on;
+		regulator-always-on;
 	};
 
 	reserved-memory {
@@ -1540,7 +1543,6 @@
 	vdda-supply = <&vreg_l3b>;
 
 	qcom,dual-dsi-mode;
-	qcom,sync-dual-dsi;
 	qcom,master-dsi;
 
 	panel@0 {
@@ -1590,10 +1592,6 @@
 	vdda-supply = <&vreg_l3b>;
 
 	qcom,dual-dsi-mode;
-	qcom,sync-dual-dsi;
-
-	assigned-clock-parents = <&mdss0_dsi0_phy 0>,
-				  <&mdss0_dsi0_phy 1>;
 };
 
 &mdss0_dsi1_out {
