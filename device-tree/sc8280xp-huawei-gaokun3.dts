@@ -157,6 +157,43 @@
 		regulator-boot-on;
 	};
 
+	vreg_avdd_5p5: regulator-avdd-5p5 {
+		compatible = "regulator-fixed";
+
+		regulator-name = "vreg_avdd_5p5";
+		regulator-min-microvolt = <5500000>;
+		regulator-max-microvolt = <5500000>;
+
+		gpio = <&tlmm 52 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+
+		regulator-boot-on;
+	};
+
+	vreg_avee_5p5: regulator-avee-5p5 {
+		compatible = "regulator-fixed";
+
+		regulator-name = "vreg_avee_5p5";
+		regulator-min-microvolt = <5500000>;
+		regulator-max-microvolt = <5500000>;
+
+		gpio = <&tlmm 53 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+
+		regulator-boot-on;
+	};
+
+	vreg_dsi_bl: regulator-dsi-bl {
+		compatible = "regulator-fixed";
+
+		regulator-name = "vreg_dsi_bl";
+
+		gpio = <&tlmm 0 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+
+		regulator-boot-on;
+	};
+
 	reserved-memory {
 		gpu_mem: gpu-mem@8bf00000 {
 			reg = <0 0x8bf00000 0 0x2000>;
@@ -1500,20 +1537,22 @@
 
 &mdss0_dsi0 {
 	status = "okay";
-	vdda-supply = <&vreg_l6b>;
+	vdda-supply = <&vreg_l3b>;
 
 	qcom,dual-dsi-mode;
+	qcom,sync-dual-dsi;
 	qcom,master-dsi;
 
 	panel@0 {
-		compatible = "himax,hx83121a";
+		compatible = "csot,ppc357db1-4", "himax,hx83121a";
 		reg = <0>;
 
 		reset-gpios = <&tlmm 38 GPIO_ACTIVE_LOW>;
 
-		vddio-supply = <&vreg_l3b>;
-		vsp-supply = <&vreg_l7b>;
-		vsn-supply = <&vreg_l7b>;
+		vddi-supply = <&vreg_l2b>;
+		avdd-supply = <&vreg_avdd_5p5>;
+		avee-supply = <&vreg_avee_5p5>;
+		bl-supply = <&vreg_dsi_bl>;
 
 		ports {
 			#address-cells = <1>;
@@ -1548,9 +1587,13 @@
 
 &mdss0_dsi1 {
 	status = "okay";
-	vdda-supply = <&vreg_l6b>;
+	vdda-supply = <&vreg_l3b>;
 
 	qcom,dual-dsi-mode;
+	qcom,sync-dual-dsi;
+
+	assigned-clock-parents = <&mdss0_dsi0_phy 0>,
+				  <&mdss0_dsi0_phy 1>;
 };
 
 &mdss0_dsi1_out {

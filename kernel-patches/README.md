@@ -1,12 +1,16 @@
 # Kernel Patches
 
-Six patches against Linux 6.18.8 for the Huawei MateBook E Go on Snapdragon 8cx Gen 3 (sc8280xp). Patches 1-4 are required for the dual-DSI DSC display (HX83121A panel); patch 5 fixes Bluetooth; patch 6 fixes EC suspend/resume. Patches 2-4 likely affect any sc8280xp DSC display.
+Five local patches against Linux 6.18.8 for the Huawei MateBook E Go on Snapdragon 8cx Gen 3 (sc8280xp). The repository now assumes the upstream SC8280XP DSI base support, upstream SC8280XP byte-clock fix, and upstream HX83121A panel driver. The remaining local queue here covers bridge handling, display timing, Bluetooth, and EC suspend/resume.
 
 ## Applying
 
 ```bash
 cd /path/to/linux-6.18.8
-for p in /path/to/kernel-patches/000*.patch; do
+for p in /path/to/kernel-patches/0001*.patch \
+         /path/to/kernel-patches/0003*.patch \
+         /path/to/kernel-patches/0004*.patch \
+         /path/to/kernel-patches/0005*.patch \
+         /path/to/kernel-patches/0006*.patch; do
     patch -p1 < "$p"
 done
 ```
@@ -14,7 +18,11 @@ done
 Dry run first:
 
 ```bash
-for p in /path/to/kernel-patches/000*.patch; do
+for p in /path/to/kernel-patches/0001*.patch \
+         /path/to/kernel-patches/0003*.patch \
+         /path/to/kernel-patches/0004*.patch \
+         /path/to/kernel-patches/0005*.patch \
+         /path/to/kernel-patches/0006*.patch; do
     patch -p1 --dry-run < "$p"
 done
 ```
@@ -32,20 +40,6 @@ done
 **Fix:** When `devm_drm_of_get_bridge()` returns `-ENODEV`, return 0 (success) without adding a bridge, allowing the PHY to continue probing.
 
 **Impact:** sc8280xp devices with USB-C ports that have DP alt-mode capability but no display connected.
-
----
-
-## 0002 -- clk: qcom: dispcc-sc8280xp: remove CLK_SET_RATE_PARENT from byte dividers
-
-**File:** `drivers/clk/qcom/dispcc-sc8280xp.c`
-
-**Problem:** The DSI byte clock runs at the wrong frequency. Expected: 85.4 MHz. Actual: 42.7 MHz (exactly half).
-
-**Root cause:** The four `byte_div_clk_src` dividers (disp{0,1}\_cc\_mdss\_byte{0,1}\_div\_clk\_src) have `CLK_SET_RATE_PARENT` set. When the DSI driver calls `clk_set_rate()` on `byte_intf_clk` (the child of the divider), the clock framework propagates the rate change up through the divider to the parent PLL. The PLL is reconfigured to produce a rate that, divided by the divider, equals the requested `byte_intf_clk` rate -- effectively halving the byte clock.
-
-**Fix:** Remove `CLK_SET_RATE_PARENT` from all four byte divider clocks. Rate changes on the divider now only adjust the divider ratio, leaving the parent PLL at its correct frequency.
-
-**Impact:** Any sc8280xp DSI display. Without this fix, the DSI link clock is wrong and the panel will not initialize.
 
 ---
 

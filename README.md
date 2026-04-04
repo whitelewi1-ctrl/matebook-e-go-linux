@@ -1,6 +1,6 @@
 # Linux on Huawei MateBook E Go (GK-W7X)
 
-Native GPU-accelerated display driver for the Huawei MateBook E Go, the first working implementation of MSM DRM with the Himax HX83121A dual-DSI panel on the Snapdragon 8cx Gen 3 (sc8280xp) platform.
+Linux enablement for the Huawei MateBook E Go on Snapdragon 8cx Gen 3 (sc8280xp), tracking the upstream SC8280XP DSI stack and upstream Himax HX83121A panel driver.
 
 ## Hardware
 
@@ -16,8 +16,8 @@ Native GPU-accelerated display driver for the Huawei MateBook E Go, the first wo
 
 ## What's included
 
-- **Panel driver** (`panel-driver/`) -- standalone kernel module for the HX83121A panel with DTB overlay loader
-- **Kernel patches** (`kernel-patches/`) -- 6 patches against Linux 6.18.8 fixing clock, DPU, bridge, Bluetooth, and EC suspend bugs
+- **Panel driver note** (`panel-driver/`) -- placeholder documenting that the repository now uses the upstream HX83121A driver
+- **Kernel patches** (`kernel-patches/`) -- 5 local patches on top of the upstream DSI base, covering display timing, bridge, Bluetooth, and EC suspend bugs
 - **Device tree** (`device-tree/`) -- DTS source and pre-built DTB for the MateBook E Go
 - **Boot configs** (`boot/`) -- reference GRUB and mkinitcpio configurations
 - **Touchscreen recovery** (`tools/touchscreen/`) -- systemd service that restores touch after panel init resets the TDDI shared GPIO
@@ -25,56 +25,62 @@ Native GPU-accelerated display driver for the Huawei MateBook E Go, the first wo
 - **Bluetooth fix** (`tools/bluetooth/`) -- NVM firmware patcher for WCN6855 BD address
 - **Diagnostic tool** (`tools/`) -- userspace tool to read DPU/DSC/INTF/DSI hardware registers
 
+## DSI status
+
+The default path for this repository is now the upstream display stack:
+
+- SC8280XP DSI controller/PHY bindings and DTS nodes are upstream
+- the Himax HX83121A panel driver is upstream
+- this repository keeps the MateBook E Go board DTS, remaining kernel fixes, and userspace recovery scripts
+
+The local out-of-tree panel implementation and overlay loader have been removed from this repository. `panel-driver/` now exists only as a note that the default path is upstream.
+
 ## Bug fixes
 
-Getting this panel working required fixing 7 bugs across 5 kernel subsystems. The 4 kernel patches address issues that affect any sc8280xp DSC dual-DSI display; the remaining 3 fixes are in the panel driver itself. An additional patch fixes EC suspend/resume.
+Getting this panel working required fixes across multiple kernel subsystems. The SC8280XP DSI base support, byte-clock fix, and HX83121A panel driver are now upstream. This repository still carries the remaining local fixes plus non-display platform fixes.
 
 1. **aux-bridge: handle missing endpoint** -- USB-C PHYs with DP alt-mode but no display output cause probe failure; return 0 on `-ENODEV` instead.
 
-2. **dispcc: remove CLK_SET_RATE_PARENT from byte dividers** -- `clk_set_rate()` on `byte_intf_clk` propagates through the divider and reconfigures the parent PLL, halving the byte clock from 85.4 MHz to 42.7 MHz.
+2. **dispcc: remove CLK_SET_RATE_PARENT from byte dividers** -- upstreamed; no longer carried in `kernel-patches/`.
 
 3. **DPU encoder: fix DSC width truncation** -- Integer division truncates `800*8/24` to 266 instead of rounding up to 267, creating a 1-pixel mismatch with the DSI host timing.
 
 4. **DPU INTF: fix widebus data_width truncation** -- `267>>1 = 133` pclks * 6 bytes = 798 bytes/line, but DSC needs 800. `DIV_ROUND_UP` gives 134 * 6 = 804, sufficient.
 
-5. **Panel driver: DSC init ordering** -- `display_on` must be sent *after* PPS and compression mode are configured, not before.
+5. **Panel driver: DSC init ordering** -- fixed in the upstream HX83121A driver; `display_on` must be sent *after* PPS and compression mode are configured, not before.
 
-6. **Panel driver: dual-link init** -- The HX83121A requires the full init sequence (vendor commands + sleep out + PPS + compression + display_on) to be sent on *both* DSI links.
+6. **Panel driver: dual-link init** -- fixed in the upstream HX83121A driver; the full init sequence must be sent on *both* DSI links.
 
-7. **Panel driver: dual-link brightness** -- Setting brightness via DCS 0x51 on two DSI links sequentially can cause a brief right-half flash. Direct writes are used (no ramping) as the flash is only visible during rapid continuous adjustment.
+7. **Panel driver: dual-link brightness** -- fixed in the upstream HX83121A driver; dual-link backlight updates must avoid visible half-panel flashing.
 
 ## Quick start
 
 ### Prerequisites
 
-- Linux kernel 6.18+ source tree (aarch64)
+- Linux kernel source tree with the upstream SC8280XP DSI nodes and upstream `panel-himax-hx83121a` driver
 - Cross-compilation toolchain (`aarch64-linux-gnu-gcc`)
 - Device tree compiler (`dtc`)
 
 ### 1. Apply kernel patches
 
 ```bash
-cd /path/to/linux-6.18.8
-for p in /path/to/matebook-e-go-linux/kernel-patches/000*.patch; do
+cd /path/to/linux
+for p in /path/to/matebook-e-go-linux/kernel-patches/0001*.patch \
+         /path/to/matebook-e-go-linux/kernel-patches/0003*.patch \
+         /path/to/matebook-e-go-linux/kernel-patches/0004*.patch \
+         /path/to/matebook-e-go-linux/kernel-patches/0005*.patch \
+         /path/to/matebook-e-go-linux/kernel-patches/0006*.patch; do
     patch -p1 < "$p"
 done
 ```
 
-### 2. Build kernel with the panel driver
+`0002` is intentionally omitted here because the SC8280XP byte-clock fix is already upstream.
 
-Copy the panel driver into the kernel tree:
-
-```bash
-cp panel-driver/panel-himax-hx83121a.c drivers/gpu/drm/panel/
-```
-
-Add to `drivers/gpu/drm/panel/Kconfig` and `Makefile`, then build:
+### 2. Build kernel with the upstream panel driver
 
 ```bash
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc)
 ```
-
-Or build as an out-of-tree module using the provided Makefile in `panel-driver/`.
 
 ### 3. Install DTB and configure GRUB
 
@@ -94,6 +100,10 @@ The `devicetree` line is **required** -- the sc8280xp UEFI firmware does not pro
 The `usbhid.quirks` parameter enables the keyboard cover touchpad (see Keyboard Cover section below).
 
 See [docs/BUILDING.md](docs/BUILDING.md), [docs/BOOT_SETUP.md](docs/BOOT_SETUP.md), and [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for detailed instructions.
+
+### Legacy path
+
+If you are targeting an older kernel without the upstream SC8280XP DSI work or upstream HX83121A driver, use your external backup of the previous out-of-tree implementation. This repository no longer ships that legacy path.
 
 ## Keyboard cover touchpad
 
