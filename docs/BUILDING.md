@@ -51,11 +51,14 @@ done
 # Start from defconfig
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
 
-# Enable required options
+# Display
 scripts/config --enable CONFIG_DRM_MSM
 scripts/config --enable CONFIG_DRM_MSM_DSI
 scripts/config --module CONFIG_DRM_PANEL_HIMAX_HX83121A
 scripts/config --enable CONFIG_QCOM_DISPCC_SC8280XP
+
+# Waydroid networking (IP forwarding is required for container NAT)
+scripts/config --enable CONFIG_IP_FORWARD
 
 make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
 ```

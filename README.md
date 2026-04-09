@@ -299,21 +299,10 @@ CONFIG_NFT_MASQ=y
 CONFIG_NFT_CT=y
 CONFIG_NFT_REJECT=m
 CONFIG_NETFILTER_XT_TARGET_CHECKSUM=y
+CONFIG_IP_FORWARD=y          # Required for container NAT
 ```
 
-**Note:** `CONFIG_IP_MULTIPLE_TABLES` (policy routing) causes system freeze when waydroid GUI launches on this platform. Do not enable it.
-
-### Network fix
-
-Android's IpClient does not receive the default gateway via DHCP in the LXC veth environment. A systemd service polls for the `waydroid0` bridge and adds the default gateway when ready:
-
-```bash
-cp tools/waydroid/waydroid-net-fix.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable waydroid-net-fix.service
-```
-
-The service waits for the bridge interface to appear (up to 30s) instead of using a hardcoded sleep.
+**Note:** `CONFIG_IP_MULTIPLE_TABLES` (policy routing) may cause system freeze when waydroid GUI launches on this platform. Test before enabling.
 
 ### Play Protect certification
 
