@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-or-later
+# NetworkManager dispatcher script for Waydroid LXC bridge
+#
+# This script automatically adds the default gateway (192.168.240.1)
+# when the waydroid0 bridge interface comes up.
+#
+# This eliminates the need for:
+# - Hardcoded 15-second sleep in waydroid-net-fix.service
+# - Manual waydroid shell command
+# - Duplicate route errors on bridge addition
+#
+# Installation as root:
+#   cp tools/waydroid/90-waydroid-network-fix /etc/NetworkManager/dispatcher.d/
+#   chmod +x /etc/NetworkManager/dispatcher.d/90-waydroid-network-fix
+#
+# Note: NetworkManager must be configured to manage the waydroid0 interface.
+# Add the following to /etc/NetworkManager/conf.d/waydroid.conf:
+#   [keyfile]
+#   unmanaged-devices=except:interface-name:waydroid0
+#
+# Copyright (c) 2026 Lewis White
+
+INTERFACE="waydroid0"
+GATEWAY="192.168.240.1"
+
+case "$2" in
+    up)
+        # Wait for IPv4 address assignment
+        sleep 2
+
+        # Check if default route already exists
+        if ip route show default via "$INTERFACE" &>/dev/null; then
+            logger -t "waydroid-network-fix" "Default route already exists via $INTERFACE, skipping"
+            exit 0
+        fi
+
+        # Add default gateway route
+        logger -t "waydroid-network-fix" "Adding default gateway $GATEWAY via $INTERFACE"
+        ip route add default via "$INTERFACE" "$GATEWAY"
+
+        if [ $? -eq 0 ]; then
+            logger -t "waydroid-network-fix" "Successfully added default route via $INTERFACE"
+        else
+            logger -t "waydroid-network-fix" "Failed to add default route via $INTERFACE (exit code $?)"
+        fi
+        ;;
+
+    down)
+        # Remove default route when bridge goes down
+        logger -t "waydroid-network-fix" "Removing default route via $INTERFACE"
+        ip route del default via "$INTERFACE" 2>/dev/null
+        ;;
+
+    *)
+        logger -t "waydroid-network-fix" "Unknown action: $2, ignoring"
+        ;;
+esac

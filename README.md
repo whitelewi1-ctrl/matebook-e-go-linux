@@ -305,13 +305,15 @@ CONFIG_NETFILTER_XT_TARGET_CHECKSUM=y
 
 ### Network fix
 
-Android's IpClient does not receive the default gateway via DHCP in the LXC veth environment. A systemd service automatically adds the route:
+Android's IpClient does not receive the default gateway via DHCP in the LXC veth environment. A systemd service polls for the `waydroid0` bridge and adds the default gateway when ready:
 
 ```bash
 cp tools/waydroid/waydroid-net-fix.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable waydroid-net-fix.service
 ```
+
+The service waits for the bridge interface to appear (up to 30s) instead of using a hardcoded sleep.
 
 ### Play Protect certification
 
