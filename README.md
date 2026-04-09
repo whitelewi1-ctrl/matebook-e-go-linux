@@ -174,6 +174,49 @@ pci-pwrctrl-pwrseq
 ath11k_pci
 ```
 
+### Calibration variant (required)
+
+The WCN6855 firmware's calibration data (`board-2.bin`) includes multiple device variants. By default, it uses `qmi-chip-id=2` (generic SC8280XP), but Huawei MateBook E Go requires `qmi-chip-id=18` (HW_GK3 variant) for proper antenna calibration.
+
+**Two options to fix this:**
+
+#### Option A: Device tree overlay (recommended)
+
+Use the pre-built DTBO to automatically set the calibration variant at boot:
+
+```bash
+# Build the overlay
+dtc -@ -@ -o device-tree/sc8280xp-huawei-gaokun3-calibration.dtbo \
+    -I /usr/src/linux-headers-$(uname -r)/include \
+    device-tree/sc8280xp-huawei-gaokun3-calibration.dtso
+
+# Install to firmware directory
+sudo cp device-tree/sc8280xp-huawei-gaokun3-calibration.dtbo /lib/firmware/ath11k/
+```
+
+Reboot. The overlay will automatically apply `qcom,ath11k-calibration-variant = "HW_GK3"` when the WiFi module loads.
+
+See [docs/WIFI_CALIBRATION_DTBO.md](docs/WIFI_CALIBRATION_DTBO.md) for details.
+
+#### Option B: Manual firmware patching (legacy)
+
+Use the Python script to patch the firmware binary:
+
+```bash
+sudo python3 tools/wifi/patch_board.py \
+    /lib/firmware/ath11k/WCN6855/hw2.0/board-2.bin \
+    /lib/firmware/ath11k/WCN6855/hw2.0/board-2.bin
+```
+
+This clones the existing `qmi-chip-id=2` calibration data and appends a `qmi-chip-id=18` entry. Note: this modification is lost when the `ath11k-firmware` package updates.
+
+**After applying either fix**, verify with:
+
+```bash
+dmesg | grep -i ath11k | grep -i calibration
+iw dev wlan0 info | grep ssid
+```
+
 ## Touchscreen
 
 The HX83121A is a TDDI (Touch and Display Driver Integration) IC -- it shares GPIO 99 (reset) with the display. The panel init sequence resets this GPIO, killing the touch firmware. The UEFI `TouchPanelInit` only runs on Windows boot paths, so Linux boots without touch.

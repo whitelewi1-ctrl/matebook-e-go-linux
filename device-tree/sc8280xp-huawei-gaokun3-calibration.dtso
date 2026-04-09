@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Device tree overlay for Huawei MateBook E Go WiFi calibration
+ *
+ * This overlay adds qcom,ath11k-calibration-variant = "HW_GK3" to override
+ * the default calibration data in WCN6855 firmware board-2.bin
+ *
+ * The firmware reports qmi-chip-id=2 (generic SC8280XP variant) but this
+ * device requires qmi-chip-id=18 (HW_GK3 variant) for proper antenna
+ * calibration.
+ *
+ * To apply:
+ *   dtc -@ -@ -o sc8280xp-huawei-gaokun3-calibration.dtbo \
+ *       -I /usr/src/linux-headers-6.18/include \
+ *       sc8280xp-huawei-gaokun3-calibration.dtso
+ *
+ * Then load via:
+ *   cp sc8280xp-huawei-gaokun3-calibration.dtbo /lib/firmware/ath11k/
+ *
+ * Copyright (c) 2026, Lewis White
+ */
+
+/dts-v1/;
+
+&pcie4_port0 {
+    wifi@0 {
+        compatible = "pci17cb,1103";
+        reg = <0x10000 0x0 0x0 0x0>;
+
+        /* Override calibration variant for Huawei MateBook E Go (HW_GK3)
+         * Firmware board-2.bin reports qmi-chip-id=2 (generic SC8280XP)
+         * but this device requires qmi-chip-id=18 for proper antenna calibration
+         */
+        qcom,ath11k-calibration-variant = "HW_GK3";
+
+        vddrfacmn-supply = <&vreg_pmu_rfa_cmn_0p8>;
+        vddaon-supply = <&vreg_pmu_aon_0p8>;
+        vddwlcx-supply = <&vreg_pmu_wlcx_0p8>;
+        vddwlmx-supply = <&vreg_pmu_wlmx_0p8>;
+        vddbtcmx-supply = <&vreg_pmu_btcmx_0p8>;
+        vddpmu-supply = <&vreg_pmu_bob>;
+        vddpmumx-supply = <&vreg_pmu_bob>;
+        vddrfa0p8-supply = <&vreg_pmu_rfa_0p8>;
+        vddrfa1p2-supply = <&vreg_pmu_rfa_1p2>;
+        vddrfa1p8-supply = <&vreg_pmu_rfa_1p8>;
+        vddrfa1p9-supply = <&vreg_pmu_rfa_1p7>;
+        vddpcie1p3-supply = <&vreg_pmu_pcie_1p8>;
+        vddpcie0p9-supply = <&vreg_pmu_pcie_0p9>;
+        vddpcie1p8-supply = <&vreg_pmu_pcie_1p9>;
+    };
+};
