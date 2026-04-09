@@ -7,6 +7,8 @@
  * Copyright (c) 2024, Xuecong Chen <chenxuecong2009@outlook.com>
  *
  * Copyright (c) 2024, Pengyu Luo <mitltlatltl@gmail.com>
+ *
+ * Copyright (c) 2024-2026, Lewis White
  */
 
 /dts-v1/;
@@ -1409,11 +1411,11 @@
 		};
 
 		wake-n-pins {
-		       pins = "gpio145";
-		       function = "gpio";
-		       drive-strength = <2>;
-		       bias-pull-up;
-	       };
+				pins = "gpio145";
+				function = "gpio";
+				drive-strength = <2>;
+				bias-pull-up;
+			};
 	};
 
 	pcie4_default: pcie4-default-state {
@@ -1535,10 +1537,6 @@
 };
 
 /* ========== DSI Display Panel Configuration ========== */
-
-&mdss0 {
-	status = "okay";
-};
 
 &mdss0_dsi0 {
 	status = "okay";

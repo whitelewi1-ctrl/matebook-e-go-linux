@@ -1,6 +1,6 @@
-From: Lewis White <whitelewis@matebook-e-go>
+From: Lewis White <whitelewis1@gmail.com>
 Date: Thu, 6 Feb 2026 00:24:39 +0700
-Subject: [PATCH 1/4] bridge: aux-bridge: handle missing endpoint gracefully
+Subject: [PATCH] bridge: aux-bridge: handle missing endpoint gracefully
 
 On the Snapdragon 8cx Gen 3 (sc8280xp), some USB-C PHYs support
 DisplayPort alternate mode but have no corresponding display output
@@ -11,7 +11,7 @@ Instead of failing the entire auxiliary device probe (which prevents the
 USB-C PHY driver from loading), return 0 to succeed silently without
 adding the bridge.
 
-Signed-off-by: Lewis White <whitelewis@matebook-e-go>
+Signed-off-by: Lewis White <whitelewis1@gmail.com>
 ---
  drivers/gpu/drm/bridge/aux-bridge.c | 14 ++++++++++++--
  1 file changed, 12 insertions(+), 2 deletions(-)

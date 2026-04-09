@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """HX83121A SPI read-plane probe for MateBook E Go.
 
 This script focuses on transport/read-plane health, not touch coordinate output.

@@ -1,7 +1,6 @@
-From: Lewis White <whitelewis@gaokun3>
-Date: Sat, 8 Feb 2026
-Subject: [PATCH] Bluetooth: btqca: only set USE_BDADDR_PROPERTY when address
- is all-zero
+From: Lewis White <whitelewis1@gmail.com>
+Date: Sat, 8 Feb 2026 12:00:00 +0800
+Subject: [PATCH] Bluetooth: btqca: only set USE_BDADDR_PROPERTY when address is all-zero
 
 qca_check_bdaddr() currently sets HCI_QUIRK_USE_BDADDR_PROPERTY whenever
 the controller's BD address matches the address stored in the NVM firmware
@@ -20,7 +19,7 @@ Change the check to only set the quirk when the controller reports
 BDADDR_ANY (all zeros), which unambiguously indicates an invalid address
 that must be provided externally.
 
-Signed-off-by: Lewis White <whitelewis@gaokun3>
+Signed-off-by: Lewis White <whitelewis1@gmail.com>
 ---
  drivers/bluetooth/btqca.c | 2 +-
  1 file changed, 1 insertion(+), 1 deletion(-)

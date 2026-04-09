@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Activate Huawei MateBook E Go keyboard cover touchpad.
 
 The 12d1:10b8 keyboard cover requires:

@@ -1,6 +1,6 @@
-From: Lewis White <whitelewis@matebook-e-go>
+From: Lewis White <whitelewis1@gmail.com>
 Date: Fri, 7 Feb 2026 02:08:18 +0700
-Subject: [PATCH 4/4] drm/msm/dpu: fix widebus data_width truncation in INTF
+Subject: [PATCH] drm/msm/dpu: fix widebus data_width truncation in INTF
 
 When wide-bus mode is enabled, the INTF block computes data_width as:
 
@@ -17,7 +17,7 @@ The 2-byte shortfall causes a FIFO underflow and display failure.
 Use DIV_ROUND_UP(width, 2) instead of right-shift to round up to 134,
 giving 134 * 6 = 804 bytes, which satisfies the DSC requirement.
 
-Signed-off-by: Lewis White <whitelewis@matebook-e-go>
+Signed-off-by: Lewis White <whitelewis1@gmail.com>
 ---
  drivers/gpu/drm/msm/disp/dpu1/dpu_hw_intf.c | 7 ++++++-
  1 file changed, 6 insertions(+), 1 deletion(-)

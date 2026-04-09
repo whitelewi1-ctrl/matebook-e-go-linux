@@ -1,7 +1,6 @@
-From: Lewis White <whitelewis@matebook-e-go>
+From: Lewis White <whitelewis1@gmail.com>
 Date: Fri, 7 Feb 2026 01:59:26 +0700
-Subject: [PATCH 3/4] drm/msm/dpu: fix DSC compressed width truncation in
- encoder
+Subject: [PATCH] drm/msm/dpu: fix DSC compressed width truncation in encoder
 
 The DPU video-mode encoder computes the compressed width for DSC using
 integer division:
@@ -20,7 +19,7 @@ causes the display to fail to light up.
 Use DIV_ROUND_UP to match the DSI host's calculation, ensuring both
 sides agree on the compressed line width.
 
-Signed-off-by: Lewis White <whitelewis@matebook-e-go>
+Signed-off-by: Lewis White <whitelewis1@gmail.com>
 ---
  drivers/gpu/drm/msm/disp/dpu1/dpu_encoder_phys_vid.c | 9 +++++----
  1 file changed, 5 insertions(+), 4 deletions(-)

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 #include <stdio.h>
 #include <stdlib.h>
 #include <fcntl.h>
@@ -39,19 +40,20 @@
 /* CTL_0 */
 #define CTL0_BASE   (DPU_BASE + 0x15000)
 
-static volatile uint32_t *map_region(int fd, off_t phys_addr, size_t len) {
+static void *map_region(int fd, off_t phys_addr) {
     off_t page = phys_addr & ~0xFFF;
-    off_t offset = phys_addr - page;
-    void *ptr = mmap(NULL, len + offset, PROT_READ, MAP_SHARED, fd, page);
-    if (ptr == MAP_FAILED) { perror("mmap"); return NULL; }
-    return (volatile uint32_t *)((char *)ptr + offset);
+    void *ptr = mmap(NULL, 0x1000, PROT_READ, MAP_SHARED, fd, page);
+    if (ptr == MAP_FAILED)
+        return NULL;
+    return ptr;
 }
 
 static uint32_t read_reg(int fd, off_t addr) {
-    volatile uint32_t *p = map_region(fd, addr, 4);
-    if (!p) return 0xDEADBEEF;
-    uint32_t val = *p;
-    munmap((void *)((uintptr_t)p & ~0xFFF), 0x1000);
+    void *page = map_region(fd, addr);
+    if (!page) return 0xDEADBEEF;
+    off_t off = addr & 0xFFF;
+    uint32_t val = *(volatile uint32_t *)((char *)page + off);
+    munmap(page, 0x1000);
     return val;
 }
 

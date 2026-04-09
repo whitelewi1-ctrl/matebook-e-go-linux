@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """Patch BD address in QCA WCN6855 NVM firmware file.
 
 The NVM firmware for the WCN6855 on the Huawei MateBook E Go ships with a
@@ -86,7 +87,8 @@ def main():
     # Read device serial
     try:
         serial = open("/sys/class/dmi/id/product_serial").read().strip()
-    except (FileNotFoundError, PermissionError):
+    except (FileNotFoundError, PermissionError) as e:
+        print(f"Warning: could not read serial ({e}), using fallback", file=sys.stderr)
         serial = "gaokun3"
     print(f"Device serial: {serial}")
 

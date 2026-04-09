@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """HX83121A wakeup sequence matrix runner.
 
 Run controlled write sequences and measure whether the touch event plane

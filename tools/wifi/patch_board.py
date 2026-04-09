@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 Add a qmi-chip-id=18 variant=HW_GK3 entry to ath11k board-2.bin
 by cloning the existing qmi-chip-id=2,variant=HW_GK3 calibration data.
