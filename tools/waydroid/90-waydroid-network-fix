@@ -26,30 +26,40 @@ GATEWAY="192.168.240.1"
 
 case "$2" in
     up)
-        # Wait for IPv4 address assignment
+        # Wait for waydroid container network to be ready
         sleep 2
 
-        # Check if default route already exists
-        if ip route show default via "$INTERFACE" &>/dev/null; then
-            logger -t "waydroid-network-fix" "Default route already exists via $INTERFACE, skipping"
-            exit 0
-        fi
+        logger -t "waydroid-network-fix" "Waiting for waydroid container network"
 
-        # Add default gateway route
-        logger -t "waydroid-network-fix" "Adding default gateway $GATEWAY via $INTERFACE"
-        ip route add default via "$INTERFACE" "$GATEWAY"
+        # Poll until waydroid shell is responsive (max 30 seconds)
+        for i in $(seq 1 15); do
+            if waydroid shell -- ip route show 2>/dev/null | grep -q "192.168.240"; then
+                # Network is up inside container, check if default route exists
+                if ! waydroid shell -- ip route show 2>/dev/null | grep -q "^default"; then
+                    logger -t "waydroid-network-fix" "Adding default route in waydroid container"
+                    waydroid shell -- ip route add default via "$GATEWAY" 2>&1 | logger -t "waydroid-network-fix"
 
-        if [ $? -eq 0 ]; then
-            logger -t "waydroid-network-fix" "Successfully added default route via $INTERFACE"
-        else
-            logger -t "waydroid-network-fix" "Failed to add default route via $INTERFACE (exit code $?)"
-        fi
+                    if waydroid shell -- ip route show 2>/dev/null | grep -q "^default"; then
+                        logger -t "waydroid-network-fix" "Successfully added default route in container"
+                    else
+                        logger -t "waydroid-network-fix" "Failed to add default route in container"
+                    fi
+                else
+                    logger -t "waydroid-network-fix" "Default route already exists in container"
+                fi
+                exit 0
+            fi
+            sleep 2
+        done
+
+        logger -t "waydroid-network-fix" "Timeout waiting for waydroid container network"
+        exit 1
         ;;
 
     down)
-        # Remove default route when bridge goes down
-        logger -t "waydroid-network-fix" "Removing default route via $INTERFACE"
-        ip route del default via "$INTERFACE" 2>/dev/null
+        # Remove default route in container when bridge goes down
+        logger -t "waydroid-network-fix" "Removing default route in waydroid container"
+        waydroid shell -- ip route del default 2>/dev/null || true
         ;;
 
     *)

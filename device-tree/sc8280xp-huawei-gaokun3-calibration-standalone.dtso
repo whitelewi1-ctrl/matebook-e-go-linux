@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Standalone device tree overlay for Huawei MateBook E Go WiFi calibration
+ *
+ * This is a standalone version that doesn't require kernel DTSI includes.
+ * It directly targets the WiFi PCIe node by path.
+ *
+ * Copyright (c) 2026, Lewis White
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "qcom,sc8280xp-huawei-gaokun3";
+
+    fragment@0 {
+        target-path = "/soc@0/pcie@1c00000/pcie4_port0/wifi@0";
+
+        __overlay__ {
+            /* Override calibration variant for Huawei MateBook E Go (HW_GK3)
+             * Firmware board-2.bin reports qmi-chip-id=2 (generic SC8280XP)
+             * but this device requires qmi-chip-id=18 for proper antenna calibration
+             */
+            qcom,ath11k-calibration-variant = "HW_GK3";
+        };
+    };
+};
