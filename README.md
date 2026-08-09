@@ -11,7 +11,7 @@ Linux enablement for the Huawei MateBook E Go on Snapdragon 8cx Gen 3 (sc8280xp)
 | Panel | Himax HX83121A, 12.35" 1600x2560 @ 60/120 Hz |
 | Display link | Dual DSI with DSC 1.1 (8 bpp, slice 800x20) |
 | Backlight | DSI register 0x51 |
-| Touchscreen | Himax HX83121A TDDI, I2C 0x48/0x4F, SPI6 |
+| Touchscreen | Himax HX83121A TDDI. Current path: **SPI6 @ 12 MHz** (mode 3), IRQ tlmm 175, reset tlmm 99. Legacy path: I2C 0x48 (AHB bridge) / 0x4F (HID) |
 | Audio | WCD938x codec + WSA8835 v2 speakers (SoundWire) |
 
 ## What's included
@@ -20,7 +20,7 @@ Linux enablement for the Huawei MateBook E Go on Snapdragon 8cx Gen 3 (sc8280xp)
 - **Kernel patches** (`kernel-patches/`) -- 5 local patches on top of the upstream DSI base, covering display timing, bridge, Bluetooth, and EC suspend bugs
 - **Device tree** (`device-tree/`) -- DTS source and pre-built DTB for the MateBook E Go
 - **Boot configs** (`boot/`) -- reference GRUB and mkinitcpio configurations
-- **Touchscreen recovery** (`tools/touchscreen/`) -- systemd service that restores touch after panel init resets the TDDI shared GPIO
+- **Touchscreen recovery** (`tools/touchscreen/`) -- *deprecated;* systemd service that restored touch on the legacy I2C-HID path after panel init reset the TDDI shared GPIO. Superseded by the in-kernel SPI driver; the probe/debug scripts alongside it remain useful
 - **Touchpad activation** (`tools/touchpad/`) -- systemd service + script for keyboard cover touchpad
 - **Bluetooth fix** (`tools/bluetooth/`) -- NVM firmware patcher for WCN6855 BD address
 - **Diagnostic tool** (`tools/`) -- userspace tool to read DPU/DSC/INTF/DSI hardware registers
@@ -176,9 +176,40 @@ ath11k_pci
 
 ### Calibration variant (required)
 
-The WCN6855 firmware's calibration data (`board-2.bin`) includes multiple device variants. By default, it uses `qmi-chip-id=2` (generic SC8280XP), but Huawei MateBook E Go requires `qmi-chip-id=18` (HW_GK3 variant) for proper antenna calibration.
+> **Updated 2026-08-09 — upstream now uses a different variant string.**
+>
+> The current upstream device tree requests:
+>
+> ```dts
+> /* HACK: qmi-chip-id=18 */
+> qcom,calibration-variant = "NTM_TW220";
+> ```
+>
+> not `HW_GK3`. Both strings exist in the current upstream `board-2.bin`; only `HW_GK3` exists in
+> older copies. Mainline `ath11k` (`core.c`) reads `qcom,calibration-variant` first and falls back
+> to `qcom,ath11k-calibration-variant`, so the property name used by the overlay below still works
+> — but **the value matters**, and which of the two variants is correct for this device has not
+> been re-verified here.
+>
+> Symptom of a missing/incorrect variant: the link renegotiates roughly every 40 seconds with
+> `deauthenticated ... Reason: 34=DISASSOC_LOW_ACK` in the kernel log, because the driver falls
+> back to generic calibration. Check with:
+>
+> ```bash
+> strings /lib/firmware/ath11k/WCN6855/hw2.0/board-2.bin | grep -c NTM_TW220
+> ```
+>
+> If this returns `0` while the device tree asks for `NTM_TW220`, the firmware predates the entry
+> and must be updated from
+> [linux-firmware](https://gitlab.com/kernel-firmware/linux-firmware/-/raw/main/ath11k/WCN6855/hw2.0/board-2.bin).
+> Note that images built from `linux-gaokun-buildbot` between 2026-03-20 and 2026-07-11 shipped a
+> device tree asking for `NTM_TW220` alongside a `board-2.bin` that did not contain it, so they
+> are affected regardless of anything done locally.
 
-**Two options to fix this:**
+The WCN6855 firmware's calibration data (`board-2.bin`) includes multiple device variants. By default, it uses `qmi-chip-id=2` (generic SC8280XP), but Huawei MateBook E Go requires `qmi-chip-id=18` for proper antenna calibration.
+
+**Two options to fix this** (both predate the upstream firmware fix above; if your `board-2.bin`
+already contains the requested variant, neither is needed):
 
 #### Option A: Device tree overlay (recommended)
 
@@ -219,7 +250,30 @@ iw dev wlan0 info | grep ssid
 
 ## Touchscreen
 
-The HX83121A is a TDDI (Touch and Display Driver Integration) IC -- it shares GPIO 99 (reset) with the display. The panel init sequence resets this GPIO, killing the touch firmware. The UEFI `TouchPanelInit` only runs on Windows boot paths, so Linux boots without touch.
+> **Updated 2026-08-09 — use the SPI driver, not the I2C recovery service below.**
+>
+> The recommended path is now the in-kernel **SPI** driver with host-side coordinate computation
+> (`himax-spi-core.c` + `hx-algo.c`, by Kirikaze Chiyuki, from
+> [chiyuki0325/EGoTouchRev-Linux](https://github.com/chiyuki0325/EGoTouchRev-Linux)). It is
+> carried as `patches/others/0003-Input-touchscreen-add-Himax-HX83121A-SPI-driver.patch` in
+> [linux-gaokun-buildbot](https://github.com/KawaiiHachimi/linux-gaokun-buildbot), and upstream
+> now rates **SPI = works** versus **I2C = partial**.
+>
+> The driver claims `reset-gpios` (tlmm 99) and the interrupt (tlmm 175) directly from the device
+> tree, so **no userspace recovery service is needed** — and running the one below alongside it
+> will fight the driver over GPIO 99.
+>
+> The reverse-engineering behind the I2C path is still valuable and is kept in
+> [docs/TOUCHSCREEN.md](docs/TOUCHSCREEN.md): the UEFI DXE timeline, the DT02 / GPIO 174
+> mode-select mechanism, the AHB writability map, the flash partition table and the register map.
+> Notably, **GPIO 174 is not managed by the current device tree or driver at all**, so that
+> document remains the only written record of how the mode-select pin behaves.
+
+### Background (why the I2C path needed recovery)
+
+The HX83121A is a TDDI (Touch and Display Driver Integration) IC -- it shares GPIO 99 (reset) with the display. The panel init sequence resets this GPIO, killing the touch firmware. The UEFI `TouchPanelInit` only runs on certain boot paths, so Linux could boot without touch.
+
+### Legacy I2C recovery service — DEPRECATED
 
 The recovery service (`tools/touchscreen/`) uses a two-round I2C rebind sequence to restore touch after every boot (~7s):
 
@@ -324,11 +378,15 @@ sudo waydroid shell -- sqlite3 /data/data/com.google.android.gsf/databases/gserv
 
 ## Current status
 
+> Last reviewed against upstream on **2026-08-09**. Entries marked ⚠ changed since this list was
+> originally written; see [right-0903/linux-gaokun `## Feature Support`](https://github.com/right-0903/linux-gaokun#feature-support)
+> for the authoritative table.
+
 - Display: working (1600x2560 @ 60/120 Hz, hardware-accelerated via MSM DRM)
 - GPU: working (Adreno 690, OpenGL 4.6 + Vulkan 1.3 via freedreno/turnip)
 - Video decode: Venus hardware codec enabled (CONFIG_VIDEO_QCOM_VENUS)
 - Backlight: working (DSI-controlled, direct dual-link writes)
-- Touchscreen: working (TDDI recovery service, 1 MHz I2C)
+- ⚠ Touchscreen: working — **now via the in-kernel SPI driver** (`himax,hx83121a-ts` + `hx-algo`), which upstream rates as *works*. The I2C-HID path described in this repository is rated *partial* upstream and its recovery service is deprecated. See the Touchscreen section above.
 - Audio: working (WCD938x + WSA8835 via SoundWire + UCM patch)
 - Battery: working (huawei-gaokun-ec + huawei-gaokun-battery)
 - USB-C: working (UCSI via huawei-gaokun-ec)
@@ -337,8 +395,8 @@ sudo waydroid shell -- sqlite3 /data/data/com.google.android.gsf/databases/gserv
 - Bluetooth: working (WCN6855 / btqca, with NVM patch + kernel patch)
 - WiFi: working (WCN6855 / ath11k_pci)
 - Waydroid: working (with network fix service, Play Store certified)
-- Camera: not supported (no upstream driver)
-- Sensors: not supported (SLPI DSP, no Linux driver)
+- ⚠ Camera: **now supported upstream** — front `hi846@20` (2022 model) / `s5k4h7@2d` (2023 model), rear `s5k3l6@10`. Four `media: hi846` fixes plus a camera DTSI are carried downstream. No tuning data.
+- ⚠ Sensors: **partial** — accelerometer (rotation) works via SLPI; other sensors still unsupported.
 - Suspend: s2idle works, minor resume glitches
 
 ## Acknowledgements

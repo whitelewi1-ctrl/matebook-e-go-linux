@@ -1,5 +1,23 @@
 # Kernel Patches
 
+> ## Status review — 2026-08-09
+>
+> These patches target **Linux 6.18.8**. Mainline is now at 7.2-rc2, so verify before applying.
+> Current disposition of each, checked against
+> [right-0903/linux-gaokun](https://github.com/right-0903/linux-gaokun) and
+> [KawaiiHachimi/linux-gaokun-buildbot](https://github.com/KawaiiHachimi/linux-gaokun-buildbot):
+>
+> | Patch | Status |
+> |---|---|
+> | `0001` aux-bridge: handle missing endpoint | Not carried in either downstream tree. Check mainline before applying. |
+> | `0003` dpu encoder: DSC width truncation | Still tracked upstream as `patch sets/recommended/0010`. buildbot instead carries a differently-shaped fix, `patches/others/0005-drm-msm-dpu-fix-DSC-timing-width-truncation.patch` (added 2026-05-12). Reconcile the two before applying both. |
+> | `0004` dpu intf: widebus data_width truncation | Still tracked upstream as `patch sets/recommended/0011`; not present in buildbot's series. |
+> | `0005` btqca: USE_BDADDR_PROPERTY | **Still in active use.** Carried as `patches/others/0001` in buildbot, credited to this repository. |
+> | `0006` huawei-gaokun-ec: suspend/resume | **Still in active use.** Carried as `patches/upstream/0012` in buildbot. |
+>
+> Also note: the HX83121A **panel** driver (`panel-himax-hx83121a.c`) is now in mainline as of
+> v7.2-rc2, so `panel-driver/` here is historical.
+
 Five local patches against Linux 6.18.8 for the Huawei MateBook E Go on Snapdragon 8cx Gen 3 (sc8280xp). The repository now assumes the upstream SC8280XP DSI base support, upstream SC8280XP byte-clock fix, and upstream HX83121A panel driver. The remaining local queue here covers bridge handling, display timing, Bluetooth, and EC suspend/resume.
 
 ## Applying

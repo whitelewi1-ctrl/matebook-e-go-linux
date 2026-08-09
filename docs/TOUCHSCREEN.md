@@ -1,6 +1,44 @@
 # Touchscreen Research Notes
 
-## Status: Fully Working — Automatic Boot ROM Recovery
+> ## ⚠️ Status as of 2026-08-09 — read this first
+>
+> **This document describes the I2C-HID approach, which is no longer the recommended path.**
+>
+> The community has since moved to a **SPI-mode kernel driver with host-side coordinate
+> computation** (i.e. an actual THP driver):
+>
+> - `himax-spi-core.c` (~1478 lines) + `hx-algo.c` (~1133 lines), by Kirikaze Chiyuki,
+>   originating from [chiyuki0325/EGoTouchRev-Linux](https://github.com/chiyuki0325/EGoTouchRev-Linux)
+> - Carried downstream as `patches/others/0003-Input-touchscreen-add-Himax-HX83121A-SPI-driver.patch`
+>   in [KawaiiHachimi/linux-gaokun-buildbot](https://github.com/KawaiiHachimi/linux-gaokun-buildbot)
+> - Upstream feature table now rates **touchscreen over SPI = works**, **over I2C = partial**
+>   (occasional loss of contact while swiping)
+>
+> Consequently:
+>
+> - The conclusion below that **"no custom THP driver is needed"** turned out not to hold.
+>   One was written, and it is now the better-working path.
+> - The **`hx83121a-touch-recovery` service and its two-round bind sequence are obsolete.**
+>   The SPI driver owns `reset-gpios` (tlmm 99) and the interrupt (tlmm 175) directly via DT;
+>   no userspace recovery is involved.
+> - The I2C bus is retained in the current device tree only for userspace debugging
+>   (`/* himax ic @48 @49, enable this bus for userspace i2c IO */`).
+>
+> **What in this document is still valid and not available anywhere else:** the hardware
+> reverse-engineering — the UEFI DXE initialization timeline, the DT02 / GPIO 174 mode-select
+> mechanism, the AHB address-space writability map, the flash partition table, and the register
+> map. In particular, **GPIO 174 is not managed by the current DT or by the SPI driver at all**
+> (neither contains any reference to it), so the mode-select pin is currently left in whatever
+> state UEFI happened to leave it in. This document remains the only written record of how that
+> pin works.
+>
+> Treat the sections below as a **hardware reference and historical record**, not as installation
+> instructions. Deprecated procedures are marked inline.
+
+## Historical status (2026-03-08): Fully Working — Automatic Boot ROM Recovery
+
+> **Superseded 2026-08-09.** Accurate for the I2C-HID path at the time of writing.
+> See the status banner above.
 
 ## Latest Update (2026-03-08)
 
@@ -50,7 +88,11 @@ The HX83121A touchscreen now works reliably on the internal NVMe Arch Linux inst
 11. Bind i2c_hid_of — touch input devices appear
 ```
 
-### Deployment
+### Deployment — DEPRECATED (2026-08-09)
+
+> Do not use on a current kernel. The SPI driver (`himax,hx83121a-ts`) handles reset and
+> interrupt itself; running this service alongside it will fight the driver over GPIO 99.
+> Kept for reference on the I2C-HID path only.
 
 ```bash
 # Copy recovery script
@@ -73,7 +115,7 @@ systemctl enable hx83121a-touch-recovery.service
 |-----------|-------|
 | Touch IC | Himax HX83121A (TDDI — same IC as display driver) |
 | Chip ID | 0x83121A00 |
-| SPI Bus | SPI6 via spidev0.0, Mode 3 (CPOL=1, CPHA=1), 1MHz |
+| SPI Bus | SPI6 via spidev0.0, Mode 3 (CPOL=1, CPHA=1). 1 MHz was the rate used for manual probing only — the IC is specified at **12 MHz** (see ACPI table below), and the current in-kernel DT uses `spi-max-frequency = <12000000>` |
 | I2C Bus | GENI SE4 at 0x990000 (proto=3=I2C) |
 | I2C Addresses | 0x48 (AHB bridge), 0x4F (HID event interface) |
 | Architecture | THP (Touchscreen Host Processing), Master/Slave dual-SPI |
@@ -108,7 +150,13 @@ When IC firmware is running (status=0x05), the standard Linux I2C-HID stack work
 - `hid-multitouch` creates: Touchscreen (5 contacts, Protocol B) + Stylus input devices
 - 60Hz report rate, ABS_MT_POSITION_X/Y 0-4096, ABS_PRESSURE 0-255, 10 slots
 - VID:PID = 4858:121A, INPUT_PROP_DIRECT
-- **No custom THP driver needed** — IC handles coordinate computation in I2C-HID mode
+- ~~**No custom THP driver needed** — IC handles coordinate computation in I2C-HID mode~~
+
+> **Corrected 2026-08-09.** This is true of the I2C-HID path in isolation: in that mode the IC
+> does compute coordinates internally. But the conclusion drawn from it — that no THP driver
+> would ever be needed — did not hold. A host-side THP driver was subsequently written for the
+> SPI path (`hx-algo.c`), and it now delivers better results than I2C-HID, which upstream rates
+> as only *partial* due to contact loss while swiping.
 
 ## GPIO 99 Reset
 
@@ -241,6 +289,75 @@ The DLL embeds 3 firmware variants for different panel types, selected by OTP pr
 
 The HX83121A uses THP (Touchscreen Host Processing) — IC outputs raw capacitive data, host software computes coordinates. On Windows, requires `HuaweiThpService` daemon. On Linux in I2C-HID mode, the IC handles coordinate computation internally — no THP needed.
 
+## Current SPI path (2026-08-09) — and what this document still answers
+
+The in-kernel device tree node used by the current SPI driver:
+
+```dts
+&spi6 {
+	qcom,force-gsi-mode;                     /* see "open issues" below */
+
+	touchscreen@0 {
+		compatible = "himax,hx83121a-ts";
+		reg = <0>;
+		interrupts-extended = <&tlmm 175 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&tlmm 99 GPIO_ACTIVE_LOW>;
+		panel = <&panel>;
+		spi-max-frequency = <12000000>;
+		touchscreen-size-x = <2560>;         /* upstream uses 25600 — see below */
+		touchscreen-size-y = <1600>;         /* upstream uses 16000 */
+		touchscreen-swapped-x-y;
+		touchscreen-inverted-x;
+	};
+};
+```
+
+Note that IRQ (175) and reset (99) match the values documented in the hardware table above.
+
+### Open issues in the current path
+
+**1. GPIO 174 (mode select) is unmanaged.**
+
+Neither the device tree nor the SPI driver contains any reference to GPIO 174. The pin is left
+in whatever state UEFI left it in. Per the UEFI timeline documented below, `I2cTouchPanel`
+(Phase 3) ends by driving 174 LOW — i.e. SPI mode — which is what the SPI driver needs, so the
+common boot path happens to work.
+
+This is fragile rather than slow: mode select is a binary choice of which physical interface the
+IC listens on, so a wrong state means chip detection fails outright, not that touch degrades.
+The risk is on boot paths where `TouchPanelInit` does not run (documented above) and potentially
+across suspend/resume, where nothing in the kernel can drive the pin back.
+
+**2. `qcom,force-gsi-mode` currently has no effect in some trees.**
+
+The property originates from `right-0903/linux-gaokun` commit `f6b55e5`
+("force to use GPI DMA for spi touchscreen") and requires the companion patch
+`0025-spi-qcom-geni-Add-property-to-force-GSI-mode`. Mainline `spi-geni-qcom.c` selects its
+transfer mode purely from a hardware readback of `GENI_IF_DISABLE_RO`, and has no way to
+request GSI/GPI DMA; if the companion patch is absent the DT property is silently ignored.
+
+This matters for a polling THP driver: the event stack read is
+
+```
+128 + (2 + 60*40 + 40 + 60) * 2 = 5132 bytes per frame
+                                ≈ 301 KB/s @ 60 Hz, 601 KB/s @ 120 Hz
+```
+
+Large reads still fall through to SE_DMA, but the many small register transactions of the Himax
+bus protocol go through the PIO FIFO path, each interrupt-driven and each re-running the
+transfer setup.
+
+**3. Reported touch resolution differs between trees.**
+
+`right-0903` commit `de126d3` ("touchscreen: support 10x touch resolution", 2026-04-05) changed
+both its DTS (`2560/1600` → `25600/16000`) and its own DKMS driver constants
+(`X_SCALE 45 → 9`, `X_TOTAL/Y_TOTAL` ×10) together. The buildbot tree still carries `2560/1600`
+while using a *different* driver (chiyuki0325's), which sets `input_set_abs_params(..., 0,
+SZ_64K - 1, 8, 0)` and then lets `touchscreen_parse_properties()` override the maximum from DT.
+Whether `2560` or `25600` is correct therefore depends on the coordinate scale that driver's
+algorithm emits, which has not been confirmed here. If the DT maximum is lower than the scale
+the algorithm produces, motion would appear quantized.
+
 ## Companion Docs
 - `docs/TOUCHSCREEN_LIVE_TEST_2026-02-11.md` — 6 rounds of live testing
 - `docs/TOUCHSCREEN_READ_PLANE_DEBUG_2026-02-11.md` — SPI event plane debug
@@ -253,3 +370,7 @@ The HX83121A uses THP (Touchscreen Host Processing) — IC outputs raw capacitiv
 - [MiCode/Xiaomi_Kernel_OpenSource (dagu-s-oss)](https://github.com/MiCode/Xiaomi_Kernel_OpenSource/tree/dagu-s-oss/drivers/input/touchscreen/hxchipset) — Himax driver with SRAM write (not applicable to our IC)
 - [HimaxSoftware/hx_hid_util](https://github.com/HimaxSoftware/hx_hid_util) — Official Himax HID utility
 - [linux-gaokun](https://github.com/right-0903/linux-gaokun) — MateBook E Go Linux support project
+- [chiyuki0325/EGoTouchRev-Linux](https://github.com/chiyuki0325/EGoTouchRev-Linux) — **current SPI
+  touchscreen driver and tuning algorithm** (the path that superseded this document's I2C-HID approach)
+- [KawaiiHachimi/linux-gaokun-buildbot](https://github.com/KawaiiHachimi/linux-gaokun-buildbot) —
+  packaging/build tree carrying the SPI driver patch and prebuilt Fedora/Ubuntu images
